@@ -413,10 +413,14 @@ def synthesize_observation(env: Env, c_idx: int, x_idx: int, snr_db: float,
 # -----------------------------
 def decode_case_I(env: Env, Y: Tensor) -> Tuple[int, int, Tensor, Tensor]:
     """
-    Joint ML decoding using NEW projection to column space method:
+    Joint ML decoding using projection to column space method.
+    
+    STAGE 1 (Detection): 
       maximize ||Xi_c Xi_c^† Y^H x||^2 + ||Xi_c Xi_c^† Y^H 1||^2
     
-    This preserves signal energy by projecting TO the column space.
+    STAGE 2 (Channel Estimation - Paper's Formula):
+     gamma_SR  = (1/L) · Xi_ĉ^† · [Y^T · 1]
+     gamma_STR = (1/L) · Xi_ĉ^† · [Y^T · x̂(ĉ)]
     
     Returns:
       (c_hat, x_hat, gamma_SR_hat, gamma_STR_hat)
@@ -425,6 +429,9 @@ def decode_case_I(env: Env, Y: Tensor) -> Tuple[int, int, Tensor, Tensor]:
     L, U, Ma = env.L, env.U, env.Ma
     ones = torch.ones((L, 1), dtype=complex_dtype, device=device)
 
+    # ============================================================
+    # STAGE 1: DETECTION
+    # ============================================================
     YH = Y.conj().T  # (K,L)
 
     best_val = float("-inf")  # Maximize energy in column space
@@ -452,193 +459,22 @@ def decode_case_I(env: Env, Y: Tensor) -> Tuple[int, int, Tensor, Tensor]:
             best_c = c
             best_x = int(idx.item())
 
-    # Decode gamma_SR and gamma_STR at best (c, x)
-    Xi_best = env.Xi_list[best_c]
-    Xi_dag_best = env.pinv_list[best_c]
-    x_best = env.X_mat[:, best_x:best_x+1]
-    
-    # LS solution
-    lhs = torch.cat([x_best, ones], dim=1)  # (L, 2)
-    gamma_SR_hat = Xi_dag_best @ YH @ lhs[:, 1:2]  # (Q+1, 1)
-    gamma_STR_hat = Xi_dag_best @ YH @ lhs[:, 0:1]
-
-    return best_c, best_x, gamma_SR_hat, gamma_STR_hat
-
-
-def decode_case_I_LS(env: Env, Y: Tensor) -> Tuple[int, int, Tensor, Tensor]:
-    """
-    TWO-STAGE METHOD: Detection + Refined LS Estimation
-    
-    STAGE 1 (Detection): 
-      Use Case I projection method to find (ĉ, x̂)
-      maximize ||Xi_c Xi_c^† Y^H x||^2 + ||Xi_c Xi_c^† Y^H 1||^2
-    
-    STAGE 2 (Refined Estimation):
-      Given (ĉ, x̂), use full-space LS estimation:
-      
-      Model: Y = x̂·a_STR^H + 1·a_SR^H + Ω
-             where a_* = Xi_ĉ·γ_*
-      
-      Vectorize: vec(Y^H) = [x̂⊗I, 1⊗I]·[a_STR; a_SR] + vec(Ω^H)
-                           =     Φ     ·    θ        + noise
-      
-      LS solution: θ̂ = (Φ^H Φ)^{-1} Φ^H vec(Y^H)
-      Then: γ̂_* = Xi_ĉ^† â_*
-    
-    Benefits:
-      - Stage 1: High detection accuracy (區分度 ~2x)
-      - Stage 2: Low NMSE (no projection loss, uses full K×(Q+1) space)
-    
-    Returns:
-      (c_hat, x_hat, gamma_SR_hat, gamma_STR_hat)
-    """
-    device = env.device
-    L, U, Ma, K, Q = env.L, env.U, env.Ma, env.K, env.Q
-    ones = torch.ones((L, 1), dtype=complex_dtype, device=device)
-
     # ============================================================
-    # STAGE 1: DETECTION (Same as Case I)
+    # STAGE 2: CHANNEL ESTIMATION (Paper's Method)
     # ============================================================
-    YH = Y.conj().T  # (K,L)
-
-    best_val = float("-inf")
-    best_c = 0
-    best_x = 0
-
-    for c in range(Ma):
-        Xi = env.Xi_list[c]
-        Xi_dag = env.pinv_list[c]
-        Proj = Xi @ Xi_dag
-        
-        ProjYH = Proj @ YH
-        term_const = frob_norm2(ProjYH @ ones).item()
-
-        ProjX = ProjYH @ env.X_mat
-        vals = (ProjX.conj() * ProjX).real.sum(dim=0)
-        vals = vals + term_const
-
-        vmax, idx = torch.max(vals, dim=0)
-        if vmax.item() > best_val:
-            best_val = vmax.item()
-            best_c = c
-            best_x = int(idx.item())
-
-    # ============================================================
-    # STAGE 2: REFINED LS ESTIMATION
-    # ============================================================
-    # Now we have (ĉ, x̂), use them to estimate channels accurately
-    
-    Xi_best = env.Xi_list[best_c]  # (K, Q+1)
+    Xi_dag_best = env.pinv_list[best_c]  # (Q+1, K) - Xi^† (Σ matrix)
     x_best = env.X_mat[:, best_x:best_x+1]  # (L, 1)
     
-    # Build the measurement matrix Φ
-    # Model: vec(Y^H) = [x_best ⊗ I_K, ones ⊗ I_K] · [a_STR; a_SR] + noise
-    #        (K·L, 1) = (K·L, 2K)                  · (2K, 1)     + noise
+    # Paper's formula:gamma = (1/L) · Σ · [Y^H · signal]
+    YH = Y.conj().T  # (K, L) - Hermitian transpose for complex correlation
     
-    I_K = torch.eye(K, dtype=complex_dtype, device=device)
+    # For SR (direct path):gamma_SR = (1/L) · Σ · [Y^H · 1]
+    YH_ones = YH @ ones  # (K, 1)
+    gamma_SR_hat = (1.0 / L) * (Xi_dag_best @ YH_ones)  # (Q+1, 1)
     
-    # Construct Φ = [x_best ⊗ I_K, ones ⊗ I_K]  (K·L, 2K)
-    # For complex tensors, kron computes the Kronecker product
-    Phi_tag = torch.kron(x_best, I_K)     # (K·L, K)
-    Phi_radar = torch.kron(ones, I_K)     # (K·L, K)
-    Phi = torch.cat([Phi_tag, Phi_radar], dim=1)  # (K·L, 2K)
-    
-    # Vectorize Y^H
-    vec_YH = YH.reshape(-1, 1)  # (K·L, 1)
-    
-    # Solve LS: θ̂ = (Φ^H Φ)^{-1} Φ^H vec(Y^H)
-    # This gives [â_STR; â_SR] where â_* ∈ ℂ^K
-    PhiH_Phi = Phi.conj().T @ Phi  # (2K, 2K)
-    PhiH_vec_YH = Phi.conj().T @ vec_YH  # (2K, 1)
-    
-    theta_hat = torch.linalg.solve(PhiH_Phi, PhiH_vec_YH)  # (2K, 1)
-    
-    # Extract estimated effective channels
-    a_STR_hat = theta_hat[0:K, :]        # (K, 1)
-    a_SR_hat = theta_hat[K:2*K, :]       # (K, 1)
-    
-    # Convert back to channel taps: γ̂_* = Xi_ĉ^† â_*
-    Xi_dag_best = env.pinv_list[best_c]  # (Q+1, K)
-    gamma_STR_hat = Xi_dag_best @ a_STR_hat  # (Q+1, 1)
-    gamma_SR_hat = Xi_dag_best @ a_SR_hat    # (Q+1, 1)
-
-    return best_c, best_x, gamma_SR_hat, gamma_STR_hat
-
-
-def decode_case_I_paper(env: Env, Y: Tensor) -> Tuple[int, int, Tensor, Tensor]:
-    """
-    Paper's Method: Detection + Simple Correlation Estimation
-    
-    STAGE 1 (Detection): 
-      Use Case I projection method to find (ĉ, x̂)
-      maximize ||Xi_c Xi_c^† Y^H x||^2 + ||Xi_c Xi_c^† Y^H 1||^2
-    
-    STAGE 2 (Estimation - Paper's Formula):
-      γ̂_SR  = (1/L) · Ξ · Σ · [Y^T · 1]
-      γ̂_STR = (1/L) · Ξ · Σ · [Y^T · x̂(ĉ)]
-      
-      where:
-        - Ξ is Xi_ĉ (the convolution matrix)
-        - Σ is Xi_ĉ^† (pseudo-inverse)
-        - Y^T is the transpose of observation
-    
-    This is equivalent to:
-      γ̂_SR  = (1/L) · Xi_ĉ^† · [Y^T · 1]
-      γ̂_STR = (1/L) · Xi_ĉ^† · [Y^T · x̂]
-    
-    Returns:
-      (c_hat, x_hat, gamma_SR_hat, gamma_STR_hat)
-    """
-    device = env.device
-    L, U, Ma = env.L, env.U, env.Ma
-    ones = torch.ones((L, 1), dtype=complex_dtype, device=device)
-
-    # ============================================================
-    # STAGE 1: DETECTION (Same as Case I)
-    # ============================================================
-    YH = Y.conj().T  # (K,L)
-
-    best_val = float("-inf")
-    best_c = 0
-    best_x = 0
-
-    for c in range(Ma):
-        Xi = env.Xi_list[c]
-        Xi_dag = env.pinv_list[c]
-        Proj = Xi @ Xi_dag
-        
-        ProjYH = Proj @ YH
-        term_const = frob_norm2(ProjYH @ ones).item()
-
-        ProjX = ProjYH @ env.X_mat
-        vals = (ProjX.conj() * ProjX).real.sum(dim=0)
-        vals = vals + term_const
-
-        vmax, idx = torch.max(vals, dim=0)
-        if vmax.item() > best_val:
-            best_val = vmax.item()
-            best_c = c
-            best_x = int(idx.item())
-
-    # ============================================================
-    # STAGE 2: ESTIMATION (Paper's Formula)
-    # ============================================================
-    Xi_best = env.Xi_list[best_c]        # (K, Q+1) - Ξ matrix
-    Xi_dag_best = env.pinv_list[best_c]  # (Q+1, K) - Σ = Xi^† matrix
-    x_best = env.X_mat[:, best_x:best_x+1]  # (L, 1)
-    
-    # Paper's formula: γ̂ = (1/L) · Σ · [Y^T · signal]
-    # Y^T is (K, L), signal is (L, 1), so Y^T · signal is (K, 1)
-    
-    YT = Y.T  # (K, L)
-    
-    # For SR (direct path): γ̂_SR = (1/L) · Σ · [Y^T · 1]
-    YT_ones = YT @ ones  # (K, 1)
-    gamma_SR_hat = (1.0 / L) * (Xi_dag_best @ YT_ones)  # (Q+1, 1)
-    
-    # For STR (tag path): γ̂_STR = (1/L) · Σ · [Y^T · x̂]
-    YT_x = YT @ x_best  # (K, 1)
-    gamma_STR_hat = (1.0 / L) * (Xi_dag_best @ YT_x)  # (Q+1, 1)
+    # For STR (tag path):gamma_STR = (1/L) · Σ · [Y^H · x̂]
+    YH_x = YH @ x_best  # (K, 1)
+    gamma_STR_hat = (1.0 / L) * (Xi_dag_best @ YH_x)  # (Q+1, 1)
 
     return best_c, best_x, gamma_SR_hat, gamma_STR_hat
 
@@ -681,19 +517,22 @@ def decode_case_II(env: Env, Y: Tensor) -> Tuple[int, int, Tensor, Tensor]:
             best_c = c
             best_x = int(idx.item())
 
-    # Decode with ridge regularization
-    Xi_best = env.Xi_list[best_c]
-    x_best = env.X_mat[:, best_x:best_x+1]
-    lhs = torch.cat([x_best, ones], dim=1)
-
-    XtX = Xi_best.conj().T @ Xi_best
-    lam_SR = env.lambdas_SR[best_c]
-    lam_STR = env.lambdas_STR[best_c]
-    Q = env.Q
-    I_ch = torch.eye(Q + 1, dtype=complex_dtype, device=device)
-
-    gamma_SR_hat = torch.linalg.inv(XtX + lam_SR * I_ch) @ Xi_best.conj().T @ YH @ lhs[:, 1:2]
-    gamma_STR_hat = torch.linalg.inv(XtX + lam_STR * I_ch) @ Xi_best.conj().T @ YH @ lhs[:, 0:1]
+    # ============================================================
+    # STAGE 2: CHANNEL ESTIMATION (Paper's Method)
+    # ============================================================
+    Xi_dag_best = env.pinv_list[best_c]  # (Q+1, K) - Xi^† (Σ matrix)
+    x_best = env.X_mat[:, best_x:best_x+1]  # (L, 1)
+    
+    # Paper's formula: gamma = (1/L) · Σ · [Y^H · signal]
+    # YH already computed above as Y.conj().T
+    
+    # For SR (direct path): gamma_SR = (1/L) · Σ · [Y^H · 1]
+    YH_ones = YH @ ones  # (K, 1)
+    gamma_SR_hat = (1.0 / L) * (Xi_dag_best @ YH_ones)  # (Q+1, 1)
+    
+    # For STR (tag path): gamma_STR = (1/L) · Σ · [Y^H · x̂]
+    YH_x = YH @ x_best  # (K, 1)
+    gamma_STR_hat = (1.0 / L) * (Xi_dag_best @ YH_x)  # (Q+1, 1)
 
     return best_c, best_x, gamma_SR_hat, gamma_STR_hat
 
@@ -748,18 +587,18 @@ def run_mc(
     env: Env,
     snr_grid_db: List[float], ## SNR points in dB
     N_mc: int = 500, ## number of MC trials per SNR point
+    P_SR: float = 1.0,  ## Power for SR channel
+    P_STR: float = 1.0,  ## Power for STR channel
 ) -> Dict[str, Dict[str, List[float]]]:
     """
     For each SNR point:
       - Repeat N_mc trials; at each trial, sample (c, x), synthesize Y
-      - Run Case I/I-LS/II/III decoders
+      - Run Case I/II/III decoders
       - Accumulate MER for radar and tag; NMSE for SR & STR channels
     Returns a nested dict with per-SNR arrays.
     """
     results = {
         "CaseI": {"RadarMER": [], "TagMER": [], "NMSE_SR": [], "NMSE_STR": []},
-        "CaseI_LS": {"RadarMER": [], "TagMER": [], "NMSE_SR": [], "NMSE_STR": []},
-        "CaseI_Paper": {"RadarMER": [], "TagMER": [], "NMSE_SR": [], "NMSE_STR": []},
         "CaseII": {"RadarMER": [], "TagMER": [], "NMSE_SR": [], "NMSE_STR": []},
         "CaseIII": {"RadarMER": [], "TagMER": [], "NMSE_SR": [], "NMSE_STR": []},
     }
@@ -769,8 +608,6 @@ def run_mc(
     for snr_db in snr_grid_db:
         # Counters
         cnt_I = {"radar_err": 0, "tag_err": 0, "nmse_sr": 0.0, "nmse_str": 0.0}
-        cnt_I_LS = {"radar_err": 0, "tag_err": 0, "nmse_sr": 0.0, "nmse_str": 0.0}
-        cnt_I_Paper = {"radar_err": 0, "tag_err": 0, "nmse_sr": 0.0, "nmse_str": 0.0}
         cnt_II = {"radar_err": 0, "tag_err": 0, "nmse_sr": 0.0, "nmse_str": 0.0}
         cnt_III = {"radar_err": 0, "tag_err": 0, "nmse_sr": 0.0, "nmse_str": 0.0}
 
@@ -780,13 +617,13 @@ def run_mc(
             c_true = random.randrange(Ma)
             x_true = random.randrange(U)
             
-            # Generate random channels for this trial
+            # Generate random channels for this trial with specified powers
             device = env.device
             Q = env.Q
             gamma_SR_trial = (torch.randn(Q + 1, 1, dtype=complex_dtype, device=device) +
-                             1j * torch.randn(Q + 1, 1, dtype=complex_dtype, device=device)) / math.sqrt(2)
+                             1j * torch.randn(Q + 1, 1, dtype=complex_dtype, device=device)) * math.sqrt(P_SR / 2)
             gamma_STR_trial = (torch.randn(Q + 1, 1, dtype=complex_dtype, device=device) +
-                              1j * torch.randn(Q + 1, 1, dtype=complex_dtype, device=device)) / math.sqrt(2)
+                              1j * torch.randn(Q + 1, 1, dtype=complex_dtype, device=device)) * math.sqrt(P_STR / 2)
 
             # Synthesize observation with random channels
             Y, aux = synthesize_observation(env, c_true, x_true, snr_db, 
@@ -798,7 +635,7 @@ def run_mc(
             gamma_STR_true = aux["gamma_STR"]
             
             # ============================================================
-            # Decode with Case I (NEW: Column space projection)
+            # Decode with Case I (Column space projection with paper's estimation)
             # ============================================================
             c_hat_I, x_hat_I, gamma_SR_I, gamma_STR_I = decode_case_I(env, Y)
             if c_hat_I != c_true:
@@ -809,29 +646,7 @@ def run_mc(
             cnt_I["nmse_str"] += nmse(gamma_STR_I, gamma_STR_true)
             
             # ============================================================
-            # Decode with Case I-LS (NEW: Two-stage LS)
-            # ============================================================
-            c_hat_I_LS, x_hat_I_LS, gamma_SR_I_LS, gamma_STR_I_LS = decode_case_I_LS(env, Y)
-            if c_hat_I_LS != c_true:
-                cnt_I_LS["radar_err"] += 1
-            if x_hat_I_LS != x_true:
-                cnt_I_LS["tag_err"] += 1
-            cnt_I_LS["nmse_sr"] += nmse(gamma_SR_I_LS, gamma_SR_true)
-            cnt_I_LS["nmse_str"] += nmse(gamma_STR_I_LS, gamma_STR_true)
-            
-            # ============================================================
-            # Decode with Case I-Paper (Paper's correlation method)
-            # ============================================================
-            c_hat_I_Paper, x_hat_I_Paper, gamma_SR_I_Paper, gamma_STR_I_Paper = decode_case_I_paper(env, Y)
-            if c_hat_I_Paper != c_true:
-                cnt_I_Paper["radar_err"] += 1
-            if x_hat_I_Paper != x_true:
-                cnt_I_Paper["tag_err"] += 1
-            cnt_I_Paper["nmse_sr"] += nmse(gamma_SR_I_Paper, gamma_SR_true)
-            cnt_I_Paper["nmse_str"] += nmse(gamma_STR_I_Paper, gamma_STR_true)
-            
-            # ============================================================
-            # Decode with Case II (NEW: Ridge + Column space projection)
+            # Decode with Case II (Ridge + Column space projection)
             # ============================================================
             c_hat_II, x_hat_II, gamma_SR_II, gamma_STR_II = decode_case_II(env, Y)
             if c_hat_II != c_true:
@@ -856,8 +671,8 @@ def run_mc(
 
         # Aggregate to rates/means
         for name, cnt in zip(
-            ["CaseI", "CaseI_LS", "CaseI_Paper", "CaseII", "CaseIII"],
-            [cnt_I, cnt_I_LS, cnt_I_Paper, cnt_II, cnt_III],
+            ["CaseI", "CaseII", "CaseIII"],
+            [cnt_I, cnt_II, cnt_III],
         ):
             results[name]["RadarMER"].append(cnt["radar_err"] / N_mc)
             results[name]["TagMER"].append(cnt["tag_err"] / N_mc)
@@ -867,12 +682,6 @@ def run_mc(
         print(f"\n[SNR {snr_db:+.1f} dB] "
               f"CaseI MER(R,T)=({results['CaseI']['RadarMER'][-1]:.3f},{results['CaseI']['TagMER'][-1]:.3f}) "
               f"NMSE(SR,STR)=({results['CaseI']['NMSE_SR'][-1]:.3e},{results['CaseI']['NMSE_STR'][-1]:.3e})")
-        print(f"            "
-              f"CaseI-LS MER(R,T)=({results['CaseI_LS']['RadarMER'][-1]:.3f},{results['CaseI_LS']['TagMER'][-1]:.3f}) "
-              f"NMSE(SR,STR)=({results['CaseI_LS']['NMSE_SR'][-1]:.3e},{results['CaseI_LS']['NMSE_STR'][-1]:.3e})")
-        print(f"            "
-              f"CaseI-Paper MER(R,T)=({results['CaseI_Paper']['RadarMER'][-1]:.3f},{results['CaseI_Paper']['TagMER'][-1]:.3f}) "
-              f"NMSE(SR,STR)=({results['CaseI_Paper']['NMSE_SR'][-1]:.3e},{results['CaseI_Paper']['NMSE_STR'][-1]:.3e})")
         print(f"            "
               f"CaseII MER(R,T)=({results['CaseII']['RadarMER'][-1]:.3f},{results['CaseII']['TagMER'][-1]:.3f}) "
               f"NMSE(SR,STR)=({results['CaseII']['NMSE_SR'][-1]:.3e},{results['CaseII']['NMSE_STR'][-1]:.3e})")
@@ -898,6 +707,8 @@ def main():
     Qmin, Qmax = 10, 20
     Ma = 16
     U = 16
+    P_SR = 1.0
+    P_STR = 0.3
     Q = Qmax - Qmin
     K = Np + Q
     
@@ -910,7 +721,7 @@ def main():
     print("="*70)
     env = generate_environment_with_lambda(
         L=L, Np=Np, Qmin=Qmin, Qmax=Qmax, Ma=Ma, U=U,
-        P_SR=1.0, P_STR=1.0, seed=2025, 
+        P_SR=P_SR, P_STR=P_STR, seed=2025,
         lambda_multiplier=0.001,  # Small regularization
         use_gpu_if_available=(device.type == "cuda")
     )
@@ -919,71 +730,70 @@ def main():
     print("\n" + "="*70)
     print("MONTE CARLO SIMULATION")
     print("="*70)
-    snr_grid_db = [-12.5]
+    snr_grid_db = [-17.5, -15.0, -12.5, -10.0, -7.5, -5.0, -2.5, 0.0]
     N_mc = 500
     print(f"SNR grid: {snr_grid_db} dB")
     print(f"Trials per SNR: {N_mc}")
+    print(f"P_SR (Radar power): {P_SR}")
+    print(f"P_STR (Tag power): {P_STR}")
     
-    results = run_mc(env, snr_grid_db, N_mc=N_mc)
+    results = run_mc(env, snr_grid_db, N_mc=N_mc, P_SR=P_SR, P_STR=P_STR)
     
     # Display final results in clean format
     print("\n" + "=" * 70)
     print("=== Summary (per SNR grid order) ===")
-    for method_name in ["CaseI", "CaseI_LS", "CaseI_Paper", "CaseII", "CaseIII"]:
+    for method_name in ["CaseI", "CaseII", "CaseIII"]:
         print(f"{method_name}:")
         print(f"  RadarMER : {results[method_name]['RadarMER']}")
         print(f"  TagMER   : {results[method_name]['TagMER']}")
         print(f"  NMSE_SR  : {results[method_name]['NMSE_SR']}")
         print(f"  NMSE_STR : {results[method_name]['NMSE_STR']}")
     
-    # Highlight improvements
+    # ============================================================
+    # PLOTTING
+    # ============================================================
     print("\n" + "=" * 70)
-    print("=== IMPROVEMENT ANALYSIS ===")
+    print("GENERATING PLOTS...")
     print("=" * 70)
-    for i, snr_db in enumerate(snr_grid_db):
-        print(f"\nSNR = {snr_db:+.1f} dB:")
-        
-        # Detection accuracy
-        print(f"\n  Detection Accuracy:")
-        print(f"    Case I:       Radar MER = {results['CaseI']['RadarMER'][i]:.3f}, Tag MER = {results['CaseI']['TagMER'][i]:.3f}")
-        print(f"    Case I-LS:    Radar MER = {results['CaseI_LS']['RadarMER'][i]:.3f}, Tag MER = {results['CaseI_LS']['TagMER'][i]:.3f}")
-        print(f"    Case I-Paper: Radar MER = {results['CaseI_Paper']['RadarMER'][i]:.3f}, Tag MER = {results['CaseI_Paper']['TagMER'][i]:.3f}")
-        
-        # NMSE comparison
-        nmse_sr_I = results['CaseI']['NMSE_SR'][i]
-        nmse_str_I = results['CaseI']['NMSE_STR'][i]
-        nmse_sr_I_LS = results['CaseI_LS']['NMSE_SR'][i]
-        nmse_str_I_LS = results['CaseI_LS']['NMSE_STR'][i]
-        nmse_sr_I_Paper = results['CaseI_Paper']['NMSE_SR'][i]
-        nmse_str_I_Paper = results['CaseI_Paper']['NMSE_STR'][i]
-        
-        improvement_SR_LS = (nmse_sr_I - nmse_sr_I_LS) / nmse_sr_I * 100 if nmse_sr_I > 0 else 0
-        improvement_STR_LS = (nmse_str_I - nmse_str_I_LS) / nmse_str_I * 100 if nmse_str_I > 0 else 0
-        improvement_SR_Paper = (nmse_sr_I - nmse_sr_I_Paper) / nmse_sr_I * 100 if nmse_sr_I > 0 else 0
-        improvement_STR_Paper = (nmse_str_I - nmse_str_I_Paper) / nmse_str_I * 100 if nmse_str_I > 0 else 0
-        
-        print(f"\n  Channel Estimation NMSE:")
-        print(f"    Case I:       SR = {nmse_sr_I:.4e}, STR = {nmse_str_I:.4e}")
-        print(f"    Case I-LS:    SR = {nmse_sr_I_LS:.4e}, STR = {nmse_str_I_LS:.4e}")
-        print(f"                  Improvement: SR = {improvement_SR_LS:+.1f}%, STR = {improvement_STR_LS:+.1f}%")
-        print(f"    Case I-Paper: SR = {nmse_sr_I_Paper:.4e}, STR = {nmse_str_I_Paper:.4e}")
-        print(f"                  Improvement: SR = {improvement_SR_Paper:+.1f}%, STR = {improvement_STR_Paper:+.1f}%")
-        
-        # Compare the two methods
-        print(f"\n  Comparison (Paper vs LS):")
-        if nmse_sr_I_Paper < nmse_sr_I_LS:
-            ratio_SR = nmse_sr_I_LS / nmse_sr_I_Paper if nmse_sr_I_Paper > 0 else float('inf')
-            print(f"    SR:  Paper is BETTER by {ratio_SR:.2f}x")
-        else:
-            ratio_SR = nmse_sr_I_Paper / nmse_sr_I_LS if nmse_sr_I_LS > 0 else float('inf')
-            print(f"    SR:  LS is BETTER by {ratio_SR:.2f}x")
-            
-        if nmse_str_I_Paper < nmse_str_I_LS:
-            ratio_STR = nmse_str_I_LS / nmse_str_I_Paper if nmse_str_I_Paper > 0 else float('inf')
-            print(f"    STR: Paper is BETTER by {ratio_STR:.2f}x")
-        else:
-            ratio_STR = nmse_str_I_Paper / nmse_str_I_LS if nmse_sr_I_LS > 0 else float('inf')
-            print(f"    STR: LS is BETTER by {ratio_STR:.2f}x")
+    
+    # Figure 1: Error Rate vs SNR (Joint vs Disjoint)
+    plt.figure(figsize=(10, 6))
+    plt.plot(snr_grid_db, results['CaseI']['RadarMER'], 'o-', color='b', label='Joint, Radar', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseI']['TagMER'], 's--', color='b', label='Joint, Tag', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseIII']['RadarMER'], '^-', color='r', label='Disjoint, Radar', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseIII']['TagMER'], 'v--', color='r', label='Disjoint, Tag', linewidth=2, markersize=8)
+    
+    plt.xlabel('SNR (dB)', fontsize=12)
+    plt.ylabel('Error Rate', fontsize=12)
+    plt.title('Message Error Rate vs SNR', fontsize=14, fontweight='bold')
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc='best', fontsize=10)
+    # plt.yscale('log')  # Use linear scale instead
+    plt.tight_layout()
+    plt.savefig('figure1_error_rate.png', dpi=300, bbox_inches='tight')
+    print("✓ Saved: figure1_error_rate.png")
+    
+    # Figure 2: NMSE vs SNR (Joint vs Disjoint)
+    plt.figure(figsize=(10, 6))
+    plt.plot(snr_grid_db, results['CaseI']['NMSE_SR'], 'o-', color='b', label='Joint, SR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseI']['NMSE_STR'], 's--', color='b', label='Joint, STR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseIII']['NMSE_SR'], '^-', color='r', label='Disjoint, SR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseIII']['NMSE_STR'], 'v--', color='r', label='Disjoint, STR', linewidth=2, markersize=8)
+    
+    plt.xlabel('SNR (dB)', fontsize=12)
+    plt.ylabel('NMSE', fontsize=12)
+    plt.title('Normalized Mean Square Error vs SNR', fontsize=14, fontweight='bold')
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc='best', fontsize=10)
+    # plt.yscale('log')  # Use linear scale instead
+    plt.tight_layout()
+    plt.savefig('figure2_nmse.png', dpi=300, bbox_inches='tight')
+    print("✓ Saved: figure2_nmse.png")
+    
+    plt.show()
+    print("\n" + "=" * 70)
+    print("DONE!")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
