@@ -1,0 +1,1243 @@
+# blind_decode_main.py
+# -*- coding: utf-8 -*-
+"""
+Simplified DFRC blind decoding using NEW projection method (maximize column space projection).
+Compares three decoding methods:
+- Case I: Joint ML with projection to column space (NEW method)
+- Case II: Joint ML with ridge regularization + projection to column space
+- Case III: Separate ML decoding (baseline)
+"""
+
+from __future__ import annotations
+import math
+import random
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import torch
+import matplotlib.pyplot as plt
+import numpy as np
+
+Tensor = torch.Tensor
+complex_dtype = torch.cfloat
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def set_seed(seed: int = 2025):
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def to_device(x: Tensor, device: torch.device) -> Tensor:
+    return x.to(device)
+
+
+def complex_norm2(x: Tensor) -> Tensor:
+    """Return squared l2 norm (sum of |.|^2) as a scalar tensor."""
+    return (x.conj() * x).real.sum()
+
+
+def frob_norm2(x: Tensor) -> Tensor:
+    """Frobenius norm squared."""
+    return (x.conj() * x).real.sum()
+
+
+def nmse(est: Tensor, ref: Tensor) -> float:
+    """Complex NMSE (||e - r||^2 / ||r||^2)."""
+    num = complex_norm2(est - ref).item()
+    den = complex_norm2(ref).item() + 1e-12
+    return float(num / den)
+
+
+# -----------------------------
+# TEST 2: Tag Codebook Properties
+# -----------------------------
+def zadoff_chu(N: int, root: int) -> Tensor:
+    """
+    Generate a length-N Zadoff-Chu sequence (unit-modulus CAZAC).
+
+    For prime-length N and root r coprime to N:
+        s[n] = exp(-j * pi * r * n * (n + 1) / N), n = 0,...,N-1
+    We also allow generic N; we still get a near-CAZAC unit-modulus sequence.
+    """
+    n = torch.arange(N, dtype=torch.float64)
+    phase = -math.pi * root * n * (n + 1) / N
+    s = torch.exp(1j * torch.tensor(phase))
+    return s.to(complex_dtype)
+
+
+def build_waveform_set(Np: int, Ma: int, device: torch.device, max_crosscorr: float = 0.15) -> Tensor:
+    """
+    Build Ma unit-modulus, near-orthogonal baseband waveforms of length Np.
+    Strategy: generate a bank of ZC sequences with different coprime roots, 
+    selecting roots that minimize maximum cross-correlation.
+    
+    Args:
+        Np: Waveform length
+        Ma: Number of waveforms needed
+        device: torch device
+        max_crosscorr: Maximum allowed cross-correlation threshold (default 0.15)
+    
+    Note: For non-prime Np, ZC sequences may not achieve ideal low cross-correlation.
+    The function will try to select roots with the best mutual correlation properties.
+    """
+    # First, collect all coprime roots
+    all_coprime_roots = []
+    for r in range(1, min(Np, 4 * Ma)):
+        if math.gcd(r, Np) == 1:
+            all_coprime_roots.append(r)
+    
+    if len(all_coprime_roots) == 0:
+        raise ValueError(f"No coprime roots found for Np={Np}")
+    
+    # Generate all candidate ZC sequences
+    candidate_seqs = {}
+    for r in all_coprime_roots:
+        candidate_seqs[r] = zadoff_chu(Np, r)
+    
+    # Greedy selection: pick roots with minimal cross-correlation
+    selected_roots = []
+    selected_seqs = []
+    
+    # Start with the first root
+    if len(all_coprime_roots) > 0:
+        first_root = all_coprime_roots[0]
+        selected_roots.append(first_root)
+        selected_seqs.append(candidate_seqs[first_root])
+    
+    # Greedily add roots that have low cross-correlation with already selected ones
+    while len(selected_roots) < Ma and len(selected_roots) < len(all_coprime_roots):
+        best_root = None
+        best_max_corr = float('inf')
+        
+        for r in all_coprime_roots:
+            if r in selected_roots:
+                continue
+            
+            # Compute max cross-correlation with all selected sequences
+            max_corr = 0.0
+            cand_seq = candidate_seqs[r]
+            for sel_seq in selected_seqs:
+                # Compute normalized cross-correlation at zero shift
+                corr = (cand_seq.conj() * sel_seq).sum().abs().item() / Np
+                max_corr = max(max_corr, corr)
+            
+            # Keep track of the root with minimum max-correlation
+            if max_corr < best_max_corr:
+                best_max_corr = max_corr
+                best_root = r
+        
+        if best_root is not None:
+            selected_roots.append(best_root)
+            selected_seqs.append(candidate_seqs[best_root])
+            # print(f"  Selected root {best_root}, max cross-corr with existing: {best_max_corr:.4f}")
+    
+    if len(selected_seqs) < Ma:
+        print(f"Warning: Could only generate {len(selected_seqs)} sequences with good correlation properties (requested {Ma})")
+    
+    C = torch.stack(selected_seqs, dim=0).to(device)  # (Ma, Np), unit-modulus
+    # Normalize (already unit modulus), but keep it explicit:
+    C = C / C.abs()  # guard against any numeric deviation
+    
+    # print(f"Generated {len(selected_roots)} ZC waveforms with roots: {selected_roots[:10]}{'...' if len(selected_roots) > 10 else ''}")
+    return C  # (Ma, Np)
+
+
+def build_tag_codebook_hadamard(L: int, device: torch.device) -> Tensor:
+    """
+    Build tag codebook using Hadamard matrix (Paper Section V.A).
+    Returns L-1 orthogonal binary tag codewords (excluding all-one vector).
+    
+    Properties:
+      * Each x is orthogonal to 1_L (x ⊥ 1)
+      * ||x||^2 = L
+      * All L-1 codewords are mutually orthogonal
+      * Binary entries: +1 or -1 (after normalization)
+    
+    Args:
+        L: Frame length (must be power of 2)
+        device: torch device
+    
+    Returns:
+        X: (L, L-1) matrix of tag codewords
+    """
+    import scipy.linalg
+    
+    # Generate Hadamard matrix
+    if L & (L - 1) != 0:
+        raise ValueError(f"L={L} must be a power of 2 for Hadamard matrix")
+    
+    # Use scipy to generate Hadamard matrix
+    H = torch.tensor(scipy.linalg.hadamard(L), dtype=torch.float32, device=device)
+    
+    # Remove the all-ones column (first column typically)
+    # Find the all-ones column BEFORE converting to complex
+    ones = torch.ones(L, device=device)
+    dot_products = torch.abs(H.T @ ones)
+    all_ones_idx = torch.argmax(dot_products).item()
+    
+    # Keep all columns except the all-ones column
+    cols_to_keep = [i for i in range(L) if i != all_ones_idx]
+    H_filtered = H[:, cols_to_keep]  # (L, L-1)
+    
+    # Now convert to complex (Hadamard already has ||col||^2 = L)
+    X = H_filtered.to(complex_dtype)
+    
+    print(f"\n🔧 Generated {L-1} tag codewords using Hadamard matrix (L={L})")
+    
+    # ============================================================
+    # VERIFICATION
+    # ============================================================
+    U = L - 1
+    print(f"✓ Verification of {U} Hadamard codewords:")
+    
+    # 1. Check orthogonality to 1_L
+    ones = torch.ones(L, dtype=complex_dtype, device=device)
+    max_dc = 0.0
+    for u in range(U):
+        dc = torch.abs((ones.conj() @ X[:, u]) / L).item()
+        max_dc = max(max_dc, dc)
+    print(f"  - Max |<1, x_i>|/L = {max_dc:.6f} (should be ≈ 0)")
+    
+    # 2. Check norms
+    norms = torch.sqrt((X.conj() * X).real.sum(dim=0))
+    max_norm_err = torch.max(torch.abs(norms - math.sqrt(L))).item()
+    print(f"  - Max ||x_i||² error = {max_norm_err**2:.6f} (should be ≈ 0, target = {L})")
+    
+    # 3. Check mutual orthogonality
+    Gram = X.conj().T @ X  # (U, U) Gram matrix
+    Gram_off_diag = Gram - torch.diag(torch.diag(Gram))
+    max_inner = torch.max(torch.abs(Gram_off_diag)).item()
+    print(f"  - Max |<x_i, x_j>| = {max_inner:.6f} (i≠j, should be ≈ 0 for Hadamard)")
+    
+    return X  # (L, L-1)
+
+
+def build_tag_codebook(L: int, U: int, device: torch.device) -> Tensor:
+    """
+    Build U codewords x in C^L with the following properties:
+      * Each x is orthogonal to 1_L (x ⊥ 1)
+      * ||x||^2 = L
+      * When U ≤ L-1: codewords are mutually orthogonal (x_i ⊥ x_j for i≠j)
+      * When U > L-1: first L-1 codewords are orthogonal, remaining ones only satisfy x ⊥ 1
+                      and are generated to minimize correlation with existing codewords
+    
+    Construction using Gram-Schmidt:
+    1. For u = 1 to min(U, L-1): generate orthogonal codewords
+    2. For u = L to U (if U > L-1): generate codewords only orthogonal to 1_L
+    3. Verify: uniqueness, norm, correlation
+    """
+    ones = torch.ones(L, dtype=complex_dtype)
+    X_cols = []
+    
+    # Phase 1: Generate strictly orthogonal codewords (up to L-1)
+    num_orthogonal = min(U, L - 1)
+    print(f"\n🔧 Generating {U} tag codewords (L={L}):")
+    print(f"  - Phase 1: {num_orthogonal} strictly orthogonal codewords")
+    if U > L - 1:
+        print(f"  - Phase 2: {U - num_orthogonal} additional codewords (x ⊥ 1 only)")
+    
+    for u_idx in range(num_orthogonal):
+        max_attempts = 1000
+        success = False
+        
+        for attempt in range(max_attempts):
+            # Generate random complex vector
+            v_real = torch.randn(L, dtype=torch.float64)
+            v_imag = torch.randn(L, dtype=torch.float64)
+            v = (v_real + 1j * v_imag).to(complex_dtype)
+            
+            # Step 1: Orthogonalize to 1_L
+            inner_ones = ones.conj() @ v
+            v = v - (inner_ones / (ones.conj() @ ones)) * ones
+            
+            # Step 2: Orthogonalize to all previously generated codewords
+            for x_prev in X_cols:
+                inner_prev = x_prev.conj() @ v
+                v = v - (inner_prev / (x_prev.conj() @ x_prev)) * x_prev
+            
+            # Check if v is degenerate (too small norm)
+            norm_v = torch.sqrt((v.conj() * v).real.sum()).item()
+            if norm_v > 0.1:  # Not degenerate
+                # Step 3: Normalize to energy L
+                v = v / torch.sqrt((v.conj() * v).real.sum()) * math.sqrt(L)
+                X_cols.append(v)
+                success = True
+                break
+        
+        if not success:
+            raise RuntimeError(f"Failed to generate orthogonal codeword {u_idx + 1} after {max_attempts} attempts")
+    
+    # Phase 2: Generate additional codewords (only x ⊥ 1, not mutually orthogonal)
+    if U > L - 1:
+        # Stack existing codewords for batch computation
+        X_existing = torch.stack(X_cols, dim=1)  # (L, num_orthogonal)
+        
+        for u_idx in range(num_orthogonal, U):
+            max_attempts = 10000
+            best_v = None
+            best_max_corr = float('inf')
+            
+            for attempt in range(max_attempts):
+                # Generate random complex vector
+                v_real = torch.randn(L, dtype=torch.float64)
+                v_imag = torch.randn(L, dtype=torch.float64)
+                v = (v_real + 1j * v_imag).to(complex_dtype)
+                
+                # Only orthogonalize to 1_L (not to other codewords)
+                inner_ones = ones.conj() @ v
+                v = v - (inner_ones / (ones.conj() @ ones)) * ones
+                
+                # Normalize to energy L
+                norm_v = torch.sqrt((v.conj() * v).real.sum()).item()
+                if norm_v < 0.1:  # Degenerate, skip
+                    continue
+                
+                v = v / torch.sqrt((v.conj() * v).real.sum()) * math.sqrt(L)
+                
+                # Compute max correlation with ALL existing codewords (batch)
+                corrs = torch.abs(X_existing.conj().T @ v) / L  # (num_existing,)
+                max_corr = torch.max(corrs).item()
+                
+                # Keep the best one (lowest max correlation)
+                if max_corr < best_max_corr:
+                    best_max_corr = max_corr
+                    best_v = v.clone()
+                
+                # Early stop if found a good one
+                if best_max_corr < 0.4:  # Relaxed correlation threshold
+                    break
+            
+            if best_v is not None:
+                X_cols.append(best_v)
+                # Update batch matrix
+                X_existing = torch.stack(X_cols, dim=1)
+                print(f"  ✓ Generated codeword {u_idx + 1}/{U}, max_corr={best_max_corr:.3f}")
+            else:
+                raise RuntimeError(f"Failed to generate codeword {u_idx + 1} with acceptable correlation")
+    
+    if len(X_cols) < U:
+        raise RuntimeError(f"Could only generate {len(X_cols)} codewords (requested {U})")
+    
+    X = torch.stack(X_cols, dim=1).to(device)  # (L, U)
+    
+    # ============================================================
+    # VERIFICATION
+    # ============================================================
+    print(f"\n✓ Verification of {U} codewords:")
+    
+    # 1. Check orthogonality to 1_L
+    ones_dev = torch.ones(L, dtype=complex_dtype, device=device)
+    max_dc = 0.0
+    for u in range(U):
+        dc = torch.abs((ones_dev.conj() @ X[:, u]) / L).item()
+        max_dc = max(max_dc, dc)
+    print(f"  - Max |<1, x_i>|/L = {max_dc:.6f} (should be ≈ 0)")
+    
+    # 2. Check norms
+    norms = torch.sqrt((X.conj() * X).real.sum(dim=0))
+    max_norm_err = torch.max(torch.abs(norms - math.sqrt(L))).item()
+    print(f"  - Max ||x_i||² error = {max_norm_err**2:.6f} (should be ≈ 0, target = {L})")
+    
+    # 3. Check mutual correlations
+    X_normalized = X / norms.unsqueeze(0)  # Normalize to unit norm
+    Gram = X_normalized.conj().T @ X_normalized  # (U, U) Gram matrix
+    # Set diagonal to 0 (ignore self-correlation)
+    Gram_off_diag = Gram - torch.eye(U, dtype=complex_dtype, device=device)
+    max_corr = torch.max(torch.abs(Gram_off_diag)).item()
+    mean_corr = torch.sum(torch.abs(Gram_off_diag)).item() / (U * (U - 1))
+    print(f"  - Max |<x_i, x_j>|/L = {max_corr:.3f} (i≠j)")
+    print(f"  - Mean|<x_i, x_j>|/L = {mean_corr:.3f} (i≠j)")
+    
+    # 4. Check uniqueness (no duplicate codewords)
+    num_duplicates = 0
+    for i in range(U):
+        for j in range(i + 1, U):
+            corr = torch.abs(Gram[i, j]).item()
+            if corr > 0.9999:  # Essentially identical
+                num_duplicates += 1
+    print(f"  - Duplicates: {num_duplicates} (should be 0)")
+    
+    if num_duplicates > 0:
+        raise RuntimeError(f"Found {num_duplicates} duplicate codewords!")
+    
+    return X  # (L, U)
+
+
+# -----------------------------
+# Channel generation (Rician model)
+# -----------------------------
+def generate_rician_channel(
+    Q: int,
+    sigma_d: float,
+    sigma_r: float,
+    rho: float,
+    device: torch.device
+) -> Tensor:
+    """
+    Generate Rician channel with deterministic + random components (Paper Section V.A).
+    
+    gamma = gamma_d + gamma_c
+    
+    where:
+      - gamma_d: deterministic (specular) component, all taps have magnitude sigma_d
+                 (same magnitude for all taps, phase uniformly distributed)
+      - gamma_c: random (diffuse) component, complex Gaussian with covariance matrix
+                 [C]_{i,j} = rho^{|i-j|} * sigma_r^2
+    
+    Args:
+        Q: Channel delay spread (number of taps = Q+1)
+        sigma_d: Standard deviation of deterministic component
+        sigma_r: Standard deviation of random component
+        rho: Correlation coefficient in [0, 1]
+        device: torch device
+    
+    Returns:
+        gamma: (Q+1, 1) complex channel vector
+    """
+    Q_plus_1 = Q + 1
+    
+    # Deterministic component: all taps have same magnitude sigma_d
+    # Each tap has a uniformly distributed phase in [0, 2π)
+    # Paper: "entries of gamma_d have the same magnitude sigma_d > 0"
+    phase_d = torch.rand(Q_plus_1, 1, device=device) * 2 * math.pi
+    gamma_d = sigma_d * torch.exp(1j * phase_d)
+    
+    # Random component with exponential correlation
+    if rho == 0:
+        # No correlation: i.i.d. Gaussian
+        # CN(0, sigma_r^2) means variance sigma_r^2, so std is sigma_r
+        gamma_c = (torch.randn(Q_plus_1, 1, device=device) + 
+                   1j * torch.randn(Q_plus_1, 1, device=device)) * (sigma_r / math.sqrt(2))
+    else:
+        # Correlated Gaussian: C[i,j] = rho^|i-j| * sigma_r^2
+        # Generate covariance matrix
+        indices = torch.arange(Q_plus_1, device=device).float()
+        i_idx = indices.unsqueeze(1)  # (Q+1, 1)
+        j_idx = indices.unsqueeze(0)  # (1, Q+1)
+        C = (rho ** torch.abs(i_idx - j_idx)) * (sigma_r ** 2)  # (Q+1, Q+1)
+        
+        # Cholesky decomposition for sampling
+        L_chol = torch.linalg.cholesky(C + 1e-6 * torch.eye(Q_plus_1, device=device))
+        
+        # Sample from standard normal and transform
+        z_real = torch.randn(Q_plus_1, 1, device=device)
+        z_imag = torch.randn(Q_plus_1, 1, device=device)
+        
+        gamma_c = (L_chol @ z_real + 1j * L_chol @ z_imag) / math.sqrt(2)
+    
+    gamma = gamma_d + gamma_c
+    return gamma
+
+
+# -----------------------------
+# Convolution matrix Xi_c
+# -----------------------------
+def build_Xi_linear(c: Tensor, K: int, Q: int) -> Tensor:
+    """
+    Build Xi_c in C^{K x (Q+1)} that performs *linear* convolution with (Q+1)-tap channel.
+    Column j (0-based) is c shifted down by j with zero-padding (no wrap).
+      Xi[k, j] = c[k-j] if 0 <= k-j < len(c), else 0.
+    c has length Np; K = Np + Q.
+    """
+    Np = c.numel()
+    Xi = torch.zeros((K, Q + 1), dtype=complex_dtype, device=c.device)
+    for j in range(Q + 1):
+        # indices where k - j in [0, Np-1]  => k in [j, j+Np-1]
+        start = j
+        end = j + Np  # exclusive
+        Xi[start:end, j] = c
+    return Xi  # (K, Q+1)
+
+
+# -----------------------------
+# Environment container
+# -----------------------------
+@dataclass
+class Env:
+    device: torch.device
+    L: int
+    Np: int
+    Qmin: int
+    Qmax: int
+    Q: int
+    K: int
+    Ma: int
+    U: int
+    C_mat: Tensor          # (Ma, Np)
+    X_mat: Tensor          # (L, U)
+    # Channel parameters (not fixed channels)
+    sigma_d_SR: float      # Deterministic component std for SR
+    sigma_r_SR: float      # Random component std for SR
+    sigma_d_STR: float     # Deterministic component std for STR
+    sigma_r_STR: float     # Random component std for STR
+    rho: float             # Correlation coefficient
+    Xi_list: List[Tensor]  # list of (K, Q+1)
+    pinv_list: List[Tensor]      # list of (Q+1, K) Moore-Penrose pseudo-inverse
+    proj_list: List[Tensor]      # list of (K, K) projectors (I - Xi Xi^†)
+    ridge_inv_SR: List[Tensor]   # (L*Xi^H*Xi + lambda*I)^{-1} for SR, (Q+1, Q+1)
+    ridge_inv_STR: List[Tensor]  # (L*Xi^H*Xi + lambda*I)^{-1} for STR, (Q+1, Q+1)
+    lambdas_SR: List[float] ## lambda_c for SR ridge
+    lambdas_STR: List[float] ## lambda_c for STR ridge
+
+
+# -----------------------------
+## Environment generation with custom lambda
+# -----------------------------
+
+
+def generate_environment_with_lambda(
+    L: int = 16,
+    Np: int = 31,
+    Qmin: int = 10,
+    Qmax: int = 20,
+    Ma: int = 16,
+    U: int = 15,
+    sigma_d_SR: float = 0.316,   # sqrt(0.1)
+    sigma_r_SR: float = 0.949,   # sqrt(0.9)
+    sigma_d_STR: float = 0.316,  # sqrt(0.1)
+    sigma_r_STR: float = 0.949,  # sqrt(0.9)
+    rho: float = 0.0,            # Correlation coefficient
+    seed: int = 2025,
+    lambda_strategy: str = "snr_adaptive",  # "fixed", "spectral", "snr_adaptive"
+    lambda_value: float = 0.01,  # Used when strategy="fixed"
+    use_gpu_if_available: bool = True,
+) -> Env:
+    """
+    Build environment with Rician channel parameters (Paper Section V).
+    
+    Args:
+        lambda_strategy: Strategy for choosing regularization parameter:
+            - "fixed": Use lambda_value directly
+            - "spectral": lambda = lambda_value * ||Xi Xi^H||_2
+            - "snr_adaptive": lambda = (sigma_d^2 + sigma_r^2) / SNR_target (SNR=10dB)
+    """
+    set_seed(seed)
+    device = torch.device("cuda") if (use_gpu_if_available and torch.cuda.is_available()) else torch.device("cpu")
+
+    Q = Qmax - Qmin
+    K = Np + Q
+
+    # Build waveforms and codebook
+    C_mat = build_waveform_set(Np, Ma, device)
+    
+    # Use Hadamard matrix for tag codebook (Paper Section V.A)
+    if U == L - 1:
+        X_mat = build_tag_codebook_hadamard(L, device)
+    else:
+        X_mat = build_tag_codebook(L, U, device)
+
+    # Build matrices with intelligent lambda selection
+    Xi_list: List[Tensor] = []
+    pinv_list: List[Tensor] = []
+    proj_list: List[Tensor] = []
+    ridge_inv_SR: List[Tensor] = []   # Store (L*Xi^H*Xi + lambda*I)^{-1} for SR
+    ridge_inv_STR: List[Tensor] = []  # Store (L*Xi^H*Xi + lambda*I)^{-1} for STR
+    lambdas_SR: List[float] = []
+    lambdas_STR: List[float] = []
+
+    I_K = torch.eye(K, dtype=complex_dtype, device=device)
+    
+    # Determine lambda based on strategy
+    print(f"\n Regularization Strategy: {lambda_strategy}")
+    if lambda_strategy == "snr_adaptive":
+        # lambda ~ channel_power / SNR_target
+        # SNR_target = 10 dB (reasonable target for regularization)
+        SNR_target_linear = 10.0  # 10 dB
+        channel_power_SR = sigma_d_SR**2 + sigma_r_SR**2
+        channel_power_STR = sigma_d_STR**2 + sigma_r_STR**2
+        base_lambda_SR = channel_power_SR / SNR_target_linear
+        base_lambda_STR = channel_power_STR / SNR_target_linear
+        print(f"\n📊 Lambda strategy: SNR-adaptive")
+        print(f"  - Base lambda_SR = {base_lambda_SR:.6f}")
+        print(f"  - Base lambda_STR = {base_lambda_STR:.6f}")
+    
+    for idx in range(Ma):
+        c = C_mat[idx]
+        Xi = build_Xi_linear(c, K, Q)
+        Xi_list.append(Xi)
+
+        pinv = torch.linalg.pinv(Xi)
+        pinv_list.append(pinv)
+        proj = I_K - Xi @ pinv
+        proj_list.append(proj)
+
+        # Select lambda based on strategy
+        if lambda_strategy == "fixed":
+            lam_SR = lambda_value
+            lam_STR = lambda_value
+            if idx == 0:  # Print once
+                print(f"  - Using fixed lambda = {lambda_value}")
+        elif lambda_strategy == "spectral":
+            # Scale by spectral norm of Xi Xi^H
+            A = Xi @ Xi.conj().T
+            spectral_A = torch.linalg.norm(A, ord=2).real.item()
+            lam_SR = lambda_value * spectral_A
+            lam_STR = lambda_value * spectral_A
+        elif lambda_strategy == "snr_adaptive":
+            # Use channel-power-based lambda
+            lam_SR = base_lambda_SR
+            lam_STR = base_lambda_STR
+        else:
+            raise ValueError(f"Unknown lambda_strategy: {lambda_strategy}")
+        
+        lambdas_SR.append(lam_SR)
+        lambdas_STR.append(lam_STR)
+
+        # Compute ridge regression inverse matrices with L factor (formula 37)
+        XtX = Xi.conj().T @ Xi  # (Q+1, Q+1)
+        I_ch = torch.eye(Q + 1, dtype=complex_dtype, device=device)
+
+        # (L*Xi^H*Xi + lambda*I)^{-1}
+        ridge_inv_matrix_SR = torch.linalg.inv(L * XtX + lam_SR * I_ch)
+        ridge_inv_matrix_STR = torch.linalg.inv(L * XtX + lam_STR * I_ch)
+        ridge_inv_SR.append(ridge_inv_matrix_SR)
+        ridge_inv_STR.append(ridge_inv_matrix_STR)
+
+    return Env(
+        device=device,
+        L=L, Np=Np, Qmin=Qmin, Qmax=Qmax, Q=Q, K=K, Ma=Ma, U=U,
+        C_mat=C_mat, X_mat=X_mat,
+        sigma_d_SR=sigma_d_SR, sigma_r_SR=sigma_r_SR,
+        sigma_d_STR=sigma_d_STR, sigma_r_STR=sigma_r_STR,
+        rho=rho,
+        Xi_list=Xi_list, pinv_list=pinv_list, proj_list=proj_list,
+        ridge_inv_SR=ridge_inv_SR, ridge_inv_STR=ridge_inv_STR,
+        lambdas_SR=lambdas_SR, lambdas_STR=lambdas_STR
+    )
+
+
+# -----------------------------
+# Forward model
+# -----------------------------
+def synthesize_observation(env: Env, c_idx: int, x_idx: int, snr_db: float, 
+                          gamma_SR: Optional[Tensor] = None, 
+                          gamma_STR: Optional[Tensor] = None) -> Tuple[Tensor, Dict[str, Tensor]]:
+    """
+    Generate the observation Y in C^{L x K} given chosen waveform c and tag code x, at a target SNR.
+      Y = x a_STR^H + 1 a_SR^H + Omega,
+    where a_* = Xi_c gamma_* in C^K, representing the effective channels.
+    Noise variance is chosen per-trial to meet the requested SNR exactly.
+    
+    Args:
+        env: Environment with system parameters
+        c_idx: Waveform index
+        x_idx: Tag codeword index
+        snr_db: Target SNR in dB
+        gamma_SR: Optional channel vector (if None, generate using Rician model)
+        gamma_STR: Optional channel vector (if None, generate using Rician model)
+    
+    Returns:
+      Y, aux dict with alpha vectors, sigma^2, and actual gamma values used.
+    """
+    device = env.device
+    L, K = env.L, env.K
+    Q = env.Q
+    x = env.X_mat[:, x_idx:x_idx + 1]  # (L,1)
+    ones = torch.ones((L, 1), dtype=complex_dtype, device=device)
+
+    # Generate Rician channels if not provided
+    if gamma_SR is None:
+        gamma_SR = generate_rician_channel(
+            Q=Q,
+            sigma_d=env.sigma_d_SR,
+            sigma_r=env.sigma_r_SR,
+            rho=env.rho,
+            device=device
+        )
+    if gamma_STR is None:
+        gamma_STR = generate_rician_channel(
+            Q=Q,
+            sigma_d=env.sigma_d_STR,
+            sigma_r=env.sigma_r_STR,
+            rho=env.rho,
+            device=device
+        )
+
+    Xi = env.Xi_list[c_idx]  # (K, Q+1)
+    alpha_SR = Xi @ gamma_SR     # (K,1), effective SR channel
+    alpha_STR = Xi @ gamma_STR   # (K,1), effective STR channel
+
+    # Deterministic energy in the noiseless matrix, compute transmit SNR then
+    # || x a_STR^H + 1 a_SR^H ||_F^2 = ||x||^2 ||a_STR||^2 + ||1||^2 ||a_SR||^2  (cross terms vanish because x ⟂ 1)
+    signal_pow = (env.L * complex_norm2(alpha_STR) + env.L * complex_norm2(alpha_SR)).item()
+    # SNR = signal_pow / E||Omega||_F^2 = signal_pow / (L*K*sigma^2)
+    snr_lin = 10.0 ** (snr_db / 10.0)
+    sigma2 = signal_pow / (L * K * snr_lin + 1e-12) ## adjust noise power accordingly
+
+    # Noiseless:
+    Y0 = x @ alpha_STR.conj().T + ones @ alpha_SR.conj().T  # (L,K)
+    # Add complex Gaussian noise CN(0, sigma2):
+    noise = (torch.randn(L, K, dtype=complex_dtype, device=device) +
+             1j * torch.randn(L, K, dtype=complex_dtype, device=device)) * math.sqrt(sigma2 / 2.0)
+    Y = Y0 + noise
+    return Y, {"alpha_SR": alpha_SR, "alpha_STR": alpha_STR, "sigma2": torch.tensor(sigma2, device=device),
+               "gamma_SR": gamma_SR, "gamma_STR": gamma_STR}
+
+
+def synthesize_observation_case_II(
+    env: Env,
+    c_idx: int,
+    x_idx: int,
+    snr_db: float,
+    gamma_SR: Optional[Tensor] = None,
+    gamma_STR: Optional[Tensor] = None
+) -> Tuple[Tensor, dict]:
+    """
+    Generate observation matrix Y for Case II following paper's notation.
+    
+    Paper's observation model (equation above (34)):
+      Y = x(Ξ_c γ_STR)^T + 1_L(Ξ_c γ_SR)^T + Ω
+    
+    Note: This uses TRANSPOSE (not Hermitian), matching paper's Y^T notation.
+    Y is (L, K) matrix.
+    
+    Returns:
+      Y, aux dict with channel info
+    """
+    device = env.device
+    L, K = env.L, env.K
+    Q = env.Q
+    x = env.X_mat[:, x_idx:x_idx + 1]  # (L, 1)
+    ones = torch.ones((L, 1), dtype=complex_dtype, device=device)
+
+    # Generate Rician channels if not provided
+    if gamma_SR is None:
+        gamma_SR = generate_rician_channel(
+            Q=Q,
+            sigma_d=env.sigma_d_SR,
+            sigma_r=env.sigma_r_SR,
+            rho=env.rho,
+            device=device
+        )
+    if gamma_STR is None:
+        gamma_STR = generate_rician_channel(
+            Q=Q,
+            sigma_d=env.sigma_d_STR,
+            sigma_r=env.sigma_r_STR,
+            rho=env.rho,
+            device=device
+        )
+
+    Xi = env.Xi_list[c_idx]  # (K, Q+1)
+    alpha_SR = Xi @ gamma_SR     # (K, 1), effective SR channel
+    alpha_STR = Xi @ gamma_STR   # (K, 1), effective STR channel
+
+    # Signal power calculation
+    signal_pow = (env.L * complex_norm2(alpha_STR) + env.L * complex_norm2(alpha_SR)).item()
+    snr_lin = 10.0 ** (snr_db / 10.0)
+    sigma2 = signal_pow / (L * K * snr_lin + 1e-12)
+
+    # Paper's model: Y = x * alpha^T + 1 * alpha^T + noise
+    # Note: Use TRANSPOSE not conjugate transpose
+    Y0 = x @ alpha_STR.T + ones @ alpha_SR.T  # (L, K)
+    
+    # Add complex Gaussian noise
+    noise = (torch.randn(L, K, dtype=complex_dtype, device=device) +
+             1j * torch.randn(L, K, dtype=complex_dtype, device=device)) * math.sqrt(sigma2 / 2.0)
+    Y = Y0 + noise
+    
+    return Y, {"alpha_SR": alpha_SR, "alpha_STR": alpha_STR, "sigma2": torch.tensor(sigma2, device=device),
+               "gamma_SR": gamma_SR, "gamma_STR": gamma_STR}
+
+
+# -----------------------------
+# Case I: ML joint decoding (no penalty)
+# -----------------------------
+def decode_case_I(env: Env, Y: Tensor) -> Tuple[int, int, Tensor, Tensor]:
+    """
+    Joint ML decoding using projection to column space method.
+    
+    STAGE 1 (Detection): 
+      maximize ||Xi_c Xi_c^† Y^H x||^2 + ||Xi_c Xi_c^† Y^H 1||^2
+    
+    STAGE 2 (Channel Estimation - Paper's Formula):
+     gamma_SR  = (1/L) · Xi_ĉ^† · [Y^T · 1]
+     gamma_STR = (1/L) · Xi_ĉ^† · [Y^T · x̂(ĉ)]
+    
+    Returns:
+      (c_hat, x_hat, gamma_SR_hat, gamma_STR_hat)
+    """
+    device = env.device
+    L, U, Ma = env.L, env.U, env.Ma
+    ones = torch.ones((L, 1), dtype=complex_dtype, device=device)
+
+    # ============================================================
+    # STAGE 1: DETECTION
+    # ============================================================
+    YH = Y.conj().T  # (K,L)
+
+    best_val = float("-inf")  # Maximize energy in column space
+    best_c = 0
+    best_x = 0
+
+    for c in range(Ma):
+        # Project TO column space: Proj = Xi Xi^†
+        Xi = env.Xi_list[c]  # (K, Q+1)
+        Xi_dag = env.pinv_list[c]  # (Q+1, K)
+        Proj = Xi @ Xi_dag  # (K, K) - projection TO column space
+        
+        ProjYH = Proj @ YH  # (K, L)
+        term_const = frob_norm2(ProjYH @ ones).item()
+
+        # Compute ||Proj Y^H x||^2 for all x
+        ProjX = ProjYH @ env.X_mat  # (K, U)
+        vals = (ProjX.conj() * ProjX).real.sum(dim=0)  # (U,)
+        vals = vals + term_const
+
+        # Find maximum (highest energy in column space)
+        vmax, idx = torch.max(vals, dim=0)
+        if vmax.item() > best_val:
+            best_val = vmax.item()
+            best_c = c
+            best_x = int(idx.item())
+
+    # ============================================================
+    # STAGE 2: CHANNEL ESTIMATION (Paper's Method)
+    # ============================================================
+    Xi_dag_best = env.pinv_list[best_c]  # (Q+1, K) - Xi^† (Σ matrix)
+    x_best = env.X_mat[:, best_x:best_x+1]  # (L, 1)
+    
+    # Paper's formula:gamma = (1/L) · Σ · [Y^H · signal]
+    YH = Y.conj().T  # (K, L) - Hermitian transpose for complex correlation
+    
+    # For SR (direct path):gamma_SR = (1/L) · Σ · [Y^H · 1]
+    YH_ones = YH @ ones  # (K, 1)
+    gamma_SR_hat = (1.0 / L) * (Xi_dag_best @ YH_ones)  # (Q+1, 1)
+    
+    # For STR (tag path):gamma_STR = (1/L) · Σ · [Y^H · x̂]
+    YH_x = YH @ x_best  # (K, 1)
+    gamma_STR_hat = (1.0 / L) * (Xi_dag_best @ YH_x)  # (Q+1, 1)
+
+    return best_c, best_x, gamma_SR_hat, gamma_STR_hat
+
+
+def decode_case_II(env: Env, Y: Tensor) -> Tuple[int, int, Tensor, Tensor]:
+    """
+    Joint ML decoding with Tikhonov regularization.
+    Strictly follows paper's formulas (39) and (40).
+    
+    Formula (39) - Detection:
+      max_{c∈C} [ 1_L^T Y^* Ξ_c (LΞ_c^HΞ_c + λ_SR I)^{-1} Ξ_c^H Y^T 1_L^*
+                 + max_{x∈X} x^T Y^* Ξ_c (LΞ_c^HΞ_c + λ_STR I)^{-1} Ξ_c^H Y^T x^* ]
+    
+    Formula (40) - Channel estimation:
+      γ_STR = (LΞ_ĉ^HΞ_ĉ + λ_STR I)^{-1} Ξ_ĉ^H Y^T x̂^*
+      γ_SR  = (LΞ_ĉ^HΞ_ĉ + λ_SR I)^{-1} Ξ_ĉ^H Y^T 1_L^*
+    
+    Note: Paper uses Y^T (transpose), not Y^H (Hermitian transpose)
+    
+    Returns:
+      (c_hat, x_hat, gamma_SR_hat, gamma_STR_hat)
+    """
+    device = env.device
+    L, U, Ma = env.L, env.U, env.Ma
+    ones = torch.ones((L, 1), dtype=complex_dtype, device=device)
+
+    best_val_c = float("-inf")  # Maximize over c
+    best_c = 0
+    best_x_for_c = {}  # Store optimal x for each c
+
+    # ============================================================
+    # DETECTION STAGE: Formula (39)
+    # ============================================================
+    # Nested optimization: outer loop over c
+    for c in range(Ma):
+        Xi = env.Xi_list[c]  # (K, Q+1)
+        ridge_inv_SR = env.ridge_inv_SR[c]   # (Q+1, Q+1): (LΞ^HΞ + λ_SR I)^{-1}
+        ridge_inv_STR = env.ridge_inv_STR[c] # (Q+1, Q+1): (LΞ^HΞ + λ_STR I)^{-1}
+        
+        # Compute Y^* (element-wise conjugate, no transpose)
+        Y_conj = Y.conj()  # (L, K)
+        
+        # Compute Y^T (transpose, no conjugate)
+        Y_T = Y.T  # (K, L)
+        
+        # ============================================================
+        # SR TERM: 1_L^T Y^* Ξ_c M_SR Ξ_c^H Y^T 1_L^*
+        # ============================================================
+        # Step 1: 1_L^T Y^* = (1, L) @ (L, K) = (1, K)
+        ones_T_Y_conj = ones.T @ Y_conj  # (1, K)
+        
+        # Step 2: (1_L^T Y^*) Ξ_c = (1, K) @ (K, Q+1) = (1, Q+1)
+        temp1_SR = ones_T_Y_conj @ Xi  # (1, Q+1)
+        
+        # Step 3: temp1 M_SR = (1, Q+1) @ (Q+1, Q+1) = (1, Q+1)
+        temp2_SR = temp1_SR @ ridge_inv_SR  # (1, Q+1)
+        
+        # Step 4: Ξ_c^H Y^T 1_L^* = (Q+1, K) @ (K, L) @ (L, 1) = (Q+1, 1)
+        Xi_H_Y_T_ones_conj = Xi.conj().T @ Y_T @ ones.conj()  # (Q+1, 1)
+        
+        # Step 5: temp2 @ Xi_H_Y_T_ones_conj = (1, Q+1) @ (Q+1, 1) = (1, 1)
+        val_SR = (temp2_SR @ Xi_H_Y_T_ones_conj).real.item()
+        
+        # ============================================================
+        # STR TERM: max_x [ x^T Y^* Ξ_c M_STR Ξ_c^H Y^T x^* ]
+        # ============================================================
+        # For all x simultaneously:
+        # Step 1: X^T Y^* = (U, L) @ (L, K) = (U, K)
+        X_T_Y_conj = env.X_mat.T @ Y_conj  # (U, K)
+        
+        # Step 2: (X^T Y^*) Ξ_c = (U, K) @ (K, Q+1) = (U, Q+1)
+        temp1_STR = X_T_Y_conj @ Xi  # (U, Q+1)
+        
+        # Step 3: temp1 M_STR = (U, Q+1) @ (Q+1, Q+1) = (U, Q+1)
+        temp2_STR = temp1_STR @ ridge_inv_STR  # (U, Q+1)
+        
+        # Step 4: Ξ_c^H Y^T X^* = (Q+1, K) @ (K, L) @ (L, U) = (Q+1, U)
+        Xi_H_Y_T_X_conj = Xi.conj().T @ Y_T @ env.X_mat.conj()  # (Q+1, U)
+        
+        # Step 5: For each x, compute temp2[x, :] @ Xi_H_Y_T_X_conj[:, x]
+        # This is diag(temp2_STR @ Xi_H_Y_T_X_conj)
+        vals_STR = (temp2_STR * Xi_H_Y_T_X_conj.T).real.sum(dim=1)  # (U,)
+        
+        # Inner optimization: find best x for this c
+        val_STR_max, x_idx_best = torch.max(vals_STR, dim=0)
+        val_STR_max = val_STR_max.item()
+        x_idx_best = int(x_idx_best.item())
+        
+        # Store the best x for this c
+        best_x_for_c[c] = x_idx_best
+        
+        # Total objective for this c: SR term + max STR term
+        val_total_c = val_SR + val_STR_max
+        
+        # Outer optimization: update best c if this c is better
+        if val_total_c > best_val_c:
+            best_val_c = val_total_c
+            best_c = c
+    
+    # Retrieve the optimal x for the optimal c
+    best_x = best_x_for_c[best_c]
+
+    # ============================================================
+    # CHANNEL ESTIMATION STAGE: Formula (40)
+    # ============================================================
+    Xi_best = env.Xi_list[best_c]  # (K, Q+1)
+    ridge_inv_SR_best = env.ridge_inv_SR[best_c]   # (Q+1, Q+1)
+    ridge_inv_STR_best = env.ridge_inv_STR[best_c] # (Q+1, Q+1)
+    x_best = env.X_mat[:, best_x:best_x+1]  # (L, 1)
+    
+    Y_T_best = Y.T  # (K, L)
+    
+    # γ_STR = (LΞ^HΞ + λ_STR I)^{-1} Ξ^H Y^T x^*
+    gamma_STR_hat = ridge_inv_STR_best @ Xi_best.conj().T @ Y_T_best @ x_best.conj()  # (Q+1, 1)
+    
+    # γ_SR = (LΞ^HΞ + λ_SR I)^{-1} Ξ^H Y^T 1_L^*
+    gamma_SR_hat = ridge_inv_SR_best @ Xi_best.conj().T @ Y_T_best @ ones.conj()  # (Q+1, 1)
+
+    return best_c, best_x, gamma_SR_hat, gamma_STR_hat
+
+
+def decode_case_III(env: Env, Y: Tensor) -> Tuple[int, int, Tensor, Tensor]:
+    """
+    Disjoint decoding (Paper's Case III, formula 43-44):
+
+    Step 1 (Tag): x_hat = argmax_x ||Y^T x^*||^2  (formula 43)
+    Step 2 (Radar): Given x_hat, decode radar by maximizing (formula 44):
+                    max_c [||Xi_c Xi_c^† Y^T 1_L^*||^2 + ||Xi_c Xi_c^† Y^T x_hat^*||^2]
+
+    Channel estimates for NMSE reporting:
+      gamma_SR_hat = Xi^† ((1/L) Y^T 1)
+      gamma_STR_hat = Xi^† ((1/L) Y^T x_hat)
+    """
+    device = env.device
+    L, K, Ma, U = env.L, env.K, env.Ma, env.U
+    ones = torch.ones((L, 1), dtype=complex_dtype, device=device)
+
+    # ============================================================
+    # STEP 1: DECODE TAG MESSAGE (formula 43)
+    # ============================================================
+    # max_x ||Y^T x^*||^2 = max_x ||Y^H x||^2 (equivalent in our notation)
+    YH = Y.conj().T  # (K, L)
+    YHX = YH @ env.X_mat  # (K, U)
+    energy = (YHX.conj() * YHX).real.sum(dim=0)  # (U,)
+    x_idx = int(torch.argmax(energy).item())
+    x_hat = env.X_mat[:, x_idx:x_idx + 1]  # (L, 1)
+
+    # ============================================================
+    # STEP 2: DECODE RADAR MESSAGE (formula 44)
+    # ============================================================
+    # max_c [||Xi_c Xi_c^† Y^T 1_L^*||^2 + ||Xi_c Xi_c^† Y^T x_hat^*||^2]
+    best_val = float("-inf")  # Maximize
+    best_c = 0
+    
+    for c in range(Ma):
+        Xi = env.Xi_list[c]  # (K, Q+1)
+        Xi_dag = env.pinv_list[c]  # (Q+1, K)
+        Proj = Xi @ Xi_dag  # (K, K) - projection to column space
+        
+        ProjYH = Proj @ YH  # (K, L)
+        
+        # First term: ||Proj Y^H 1||^2
+        term_SR = frob_norm2(ProjYH @ ones).item()
+        
+        # Second term: ||Proj Y^H x_hat||^2
+        term_STR = frob_norm2(ProjYH @ x_hat).item()
+        
+        # Total objective
+        val = term_SR + term_STR
+        
+        if val > best_val:
+            best_val = val
+            best_c = c
+
+    # ============================================================
+    # CHANNEL ESTIMATION (for NMSE evaluation)
+    # ============================================================
+    Xi_dag_best = env.pinv_list[best_c]  # (Q+1, K)
+    
+    # gamma_SR = (1/L) Xi^† Y^T 1
+    gamma_SR_hat = (1.0 / L) * (Xi_dag_best @ (YH @ ones))
+    
+    # gamma_STR = (1/L) Xi^† Y^T x_hat
+    gamma_STR_hat = (1.0 / L) * (Xi_dag_best @ (YH @ x_hat))
+    
+    return best_c, x_idx, gamma_SR_hat, gamma_STR_hat
+
+
+# -----------------------------
+# Monte-Carlo driver
+# -----------------------------
+def run_mc(
+    env: Env,
+    snr_grid_db: List[float], ## SNR points in dB
+    N_mc: int = 500, ## number of MC trials per SNR point
+) -> Dict[str, Dict[str, List[float]]]:
+    """
+    For each SNR point:
+      - Repeat N_mc trials; at each trial, sample (c, x), generate random Rician channels
+      - Synthesize observation Y
+      - Run Case I/II/III decoders
+      - Accumulate MER for radar and tag; NMSE for SR & STR channels
+    Returns a nested dict with per-SNR arrays.
+    """
+    results = {
+        "CaseI": {"RadarMER": [], "TagMER": [], "NMSE_SR": [], "NMSE_STR": []},
+        "CaseII": {"RadarMER": [], "TagMER": [], "NMSE_SR": [], "NMSE_STR": []},
+        "CaseIII": {"RadarMER": [], "TagMER": [], "NMSE_SR": [], "NMSE_STR": []},
+    }
+
+    Ma, U = env.Ma, env.U
+    device = env.device
+    Q = env.Q
+
+    for snr_db in snr_grid_db:
+        # Counters
+        cnt_I = {"radar_err": 0, "tag_err": 0, "nmse_sr": 0.0, "nmse_str": 0.0}
+        cnt_II = {"radar_err": 0, "tag_err": 0, "nmse_sr": 0.0, "nmse_str": 0.0}
+        cnt_III = {"radar_err": 0, "tag_err": 0, "nmse_sr": 0.0, "nmse_str": 0.0}
+
+        for _ in range(N_mc):
+            print(f"SNR {snr_db} dB, Trial {_+1}/{N_mc}", end="\r")
+            
+            # Randomly sample waveform & tag messages (Paper Section V.B)
+            c_true = random.randrange(Ma)
+            x_true = random.randrange(U)
+            
+            # Generate random Rician channels for this trial (Paper Section V.A)
+            gamma_SR_trial = generate_rician_channel(
+                Q=Q,
+                sigma_d=env.sigma_d_SR,
+                sigma_r=env.sigma_r_SR,
+                rho=env.rho,
+                device=device
+            )
+            gamma_STR_trial = generate_rician_channel(
+                Q=Q,
+                sigma_d=env.sigma_d_STR,
+                sigma_r=env.sigma_r_STR,
+                rho=env.rho,
+                device=device
+            )
+
+            # Synthesize observation with random channels
+            Y, aux = synthesize_observation(env, c_true, x_true, snr_db, 
+                                          gamma_SR=gamma_SR_trial, 
+                                          gamma_STR=gamma_STR_trial)
+            
+            # True channel vectors used in this trial
+            gamma_SR_true = aux["gamma_SR"]
+            gamma_STR_true = aux["gamma_STR"]
+            
+            # ============================================================
+            # Decode with Case I (Column space projection with paper's estimation)
+            # ============================================================
+            c_hat_I, x_hat_I, gamma_SR_I, gamma_STR_I = decode_case_I(env, Y)
+            if c_hat_I != c_true:
+                cnt_I["radar_err"] += 1
+            if x_hat_I != x_true:
+                cnt_I["tag_err"] += 1
+            cnt_I["nmse_sr"] += nmse(gamma_SR_I, gamma_SR_true)
+            cnt_I["nmse_str"] += nmse(gamma_STR_I, gamma_STR_true)
+            
+            # ============================================================
+            # Decode with Case II (Ridge + Column space projection)
+            # ============================================================
+            c_hat_II, x_hat_II, gamma_SR_II, gamma_STR_II = decode_case_II(env, Y)
+            if c_hat_II != c_true:
+                cnt_II["radar_err"] += 1
+            if x_hat_II != x_true:
+                cnt_II["tag_err"] += 1
+            cnt_II["nmse_sr"] += nmse(gamma_SR_II, gamma_SR_true)
+            cnt_II["nmse_str"] += nmse(gamma_STR_II, gamma_STR_true)
+            
+            # ============================================================
+            # Decode with Case III (Baseline: Separate decoding)
+            # ============================================================
+            c_hat_III, x_hat_III, gamma_SR_III, gamma_STR_III = decode_case_III(env, Y)
+            if c_hat_III != c_true:
+                cnt_III["radar_err"] += 1
+            if x_hat_III != x_true:
+                cnt_III["tag_err"] += 1
+            cnt_III["nmse_sr"] += nmse(gamma_SR_III, gamma_SR_true)
+            cnt_III["nmse_str"] += nmse(gamma_STR_III, gamma_STR_true)
+
+
+
+        # Aggregate to rates/means
+        for name, cnt in zip(
+            ["CaseI", "CaseII", "CaseIII"],
+            [cnt_I, cnt_II, cnt_III],
+        ):
+            results[name]["RadarMER"].append(cnt["radar_err"] / N_mc)
+            results[name]["TagMER"].append(cnt["tag_err"] / N_mc)
+            results[name]["NMSE_SR"].append(cnt["nmse_sr"] / N_mc)
+            results[name]["NMSE_STR"].append(cnt["nmse_str"] / N_mc)
+
+        print(f"\n[SNR {snr_db:+.1f} dB] "
+              f"CaseI MER(R,T)=({results['CaseI']['RadarMER'][-1]:.3f},{results['CaseI']['TagMER'][-1]:.3f}) "
+              f"NMSE(SR,STR)=({results['CaseI']['NMSE_SR'][-1]:.3e},{results['CaseI']['NMSE_STR'][-1]:.3e})")
+        print(f"            "
+              f"CaseII MER(R,T)=({results['CaseII']['RadarMER'][-1]:.3f},{results['CaseII']['TagMER'][-1]:.3f}) "
+              f"NMSE(SR,STR)=({results['CaseII']['NMSE_SR'][-1]:.3e},{results['CaseII']['NMSE_STR'][-1]:.3e})")
+        print(f"            "
+              f"CaseIII MER(R,T)=({results['CaseIII']['RadarMER'][-1]:.3f},{results['CaseIII']['TagMER'][-1]:.3f}) "
+              f"NMSE(SR,STR)=({results['CaseIII']['NMSE_SR'][-1]:.3e},{results['CaseIII']['NMSE_STR'][-1]:.3e})")
+
+    return results
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    """Run MC simulation for DFRC blind decoding (Paper Section V)."""
+    print("\n" + "="*70)
+    print("DFRC BLIND DECODING - MONTE CARLO SIMULATION")
+    print("="*70)
+    
+    # System parameters (Paper Section V.A)
+    L = 16          # PRI number per frame
+    Np = 31         # Pulse length (time-bandwidth product)
+    Qmin, Qmax = 10, 30  # Channel delay spread: Q = Qmax - Qmin = 20
+    Ma = 16         # Radar codebook size
+    U = L - 1       # Tag codebook size (Hadamard: L-1 = 15)
+    Q = Qmax - Qmin  # Should be 20
+    K = Np + Q       # 31 + 20 = 51
+    
+    # Rician channel parameters (Paper Section V.A)
+    # sigma_d^2 = 0.1, sigma_r^2 = 0.9
+    sigma_d_SR = math.sqrt(0.1)
+    sigma_r_SR = math.sqrt(0.9)
+    sigma_d_STR = math.sqrt(0.1)
+    sigma_r_STR = math.sqrt(0.9)
+    rho = 0.0  # No correlation
+    
+    print(f"\nSystem Parameters:")
+    print(f"  L={L}, Np={Np}, Q={Q}, K={K}")
+    print(f"  Ma={Ma} (radar codes), U={U} (tag codes)")
+    print(f"  Channel: Rician (σ_d²={sigma_d_SR**2:.1f}, σ_r²={sigma_r_SR**2:.1f}, ρ={rho})")
+    
+    set_seed(2025)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Generate environment (will build C_mat and X_mat internally)
+    print("\n" + "="*70)
+    print("GENERATING ENVIRONMENT...")
+    print("="*70)
+    env = generate_environment_with_lambda(
+        L=L, Np=Np, Qmin=Qmin, Qmax=Qmax, Ma=Ma, U=U,
+        sigma_d_SR=sigma_d_SR, sigma_r_SR=sigma_r_SR,
+        sigma_d_STR=sigma_d_STR, sigma_r_STR=sigma_r_STR,
+        rho=rho, seed=2025,
+        lambda_strategy="fixed",  # Use fixed small lambda for stability
+        lambda_value=0.00001,  # Very small regularization for better performance
+        use_gpu_if_available=(device.type == "cuda")
+    )
+    
+    # Run Monte Carlo simulation
+    print("\n" + "="*70)
+    print("MONTE CARLO SIMULATION")
+    print("="*70)
+    snr_grid_db = [-15.0, -12.5, -10.0, -7.5, -5.0, -2.5, 0.0]
+    N_mc = 500
+    print(f"SNR grid: {snr_grid_db} dB")
+    print(f"Trials per SNR: {N_mc}")
+    print(f"Channel: Rician (σ_d²={sigma_d_SR**2:.1f}, σ_r²={sigma_r_SR**2:.1f}, ρ={rho})")
+    
+    results = run_mc(env, snr_grid_db, N_mc=N_mc)
+    
+    # Display final results in clean format
+    print("\n" + "=" * 70)
+    print("=== Summary (per SNR grid order) ===")
+    for method_name in ["CaseI", "CaseII", "CaseIII"]:
+        print(f"{method_name}:")
+        print(f"  RadarMER : {results[method_name]['RadarMER']}")
+        print(f"  TagMER   : {results[method_name]['TagMER']}")
+        print(f"  NMSE_SR  : {results[method_name]['NMSE_SR']}")
+        print(f"  NMSE_STR : {results[method_name]['NMSE_STR']}")
+    
+    # ============================================================
+    # PLOTTING
+    # ============================================================
+    print("\n" + "=" * 70)
+    print("GENERATING PLOTS...")
+    print("=" * 70)
+    
+    # Figure 1: Error Rate vs SNR (Joint vs Disjoint)
+    plt.figure(figsize=(10, 6))
+    plt.plot(snr_grid_db, results['CaseI']['RadarMER'], 'o-', color='b', label='Joint, Radar', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseI']['TagMER'], 's--', color='b', label='Joint, Tag', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseIII']['RadarMER'], '^-', color='r', label='Disjoint, Radar', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseIII']['TagMER'], 'v--', color='r', label='Disjoint, Tag', linewidth=2, markersize=8)
+    
+    plt.xlabel('SNR (dB)', fontsize=12)
+    plt.ylabel('Error Rate', fontsize=12)
+    plt.title('Message Error Rate vs SNR', fontsize=14, fontweight='bold')
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc='best', fontsize=10)
+    # plt.yscale('log')  # Use linear scale instead
+    plt.tight_layout()
+    plt.savefig('figure1_error_rate.png', dpi=300, bbox_inches='tight')
+    print("✓ Saved: figure1_error_rate.png")
+    
+    # Figure 2: NMSE vs SNR (Joint vs Disjoint)
+    plt.figure(figsize=(10, 6))
+    plt.plot(snr_grid_db, results['CaseI']['NMSE_SR'], 'o-', color='b', label='Joint, SR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseI']['NMSE_STR'], 's--', color='b', label='Joint, STR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseIII']['NMSE_SR'], '^-', color='r', label='Disjoint, SR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseIII']['NMSE_STR'], 'v--', color='r', label='Disjoint, STR', linewidth=2, markersize=8)
+    
+    plt.xlabel('SNR (dB)', fontsize=12)
+    plt.ylabel('NMSE', fontsize=12)
+    plt.title('Normalized Mean Square Error vs SNR', fontsize=14, fontweight='bold')
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc='best', fontsize=10)
+    # plt.yscale('log')  # Use linear scale instead
+    plt.tight_layout()
+    plt.savefig('figure2_nmse.png', dpi=300, bbox_inches='tight')
+    print("✓ Saved: figure2_nmse.png")
+    
+    # plt.show()  # Commented out for batch testing
+    print("\n" + "=" * 70)
+    print("DONE!")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
+
+
