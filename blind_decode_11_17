@@ -1257,8 +1257,8 @@ def main():
         sigma_d_SR=sigma_d_SR, sigma_r_SR=sigma_r_SR,
         sigma_d_STR=sigma_d_STR, sigma_r_STR=sigma_r_STR,
         rho=rho, seed=2025,
-        lambda_strategy="fixed",  # Use fixed lambda for sanity check
-        lambda_value=0.0,  # SANITY CHECK: Set λ=0, Case II should degenerate to Case I
+        lambda_strategy="fixed",
+        lambda_value=1000,  # Test with small regularization
         use_gpu_if_available=(device.type == "cuda")
     )
     
