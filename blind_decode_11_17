@@ -797,17 +797,17 @@ def decode_case_I(env: Env, Y: Tensor) -> Tuple[int, int, Tensor, Tensor]:
     # ============================================================
     # STAGE 2: CHANNEL ESTIMATION (Paper's Method)
     # ============================================================
-    Xi_dag_best = env.pinv_list[best_c]  # (Q+1, K) - Xi^† (Σ matrix)
+    Xi_dag_best = env.pinv_list[best_c]  # (Q+1, K) - Xi^† (sigma matrix)
     x_best = env.X_mat[:, best_x:best_x+1]  # (L, 1)
     
-    # Paper's formula:gamma = (1/L) · Σ · [Y^H · signal]
+    # Paper's formula:gamma = (1/L) · sigma · [Y^H · signal]
     YH = Y.conj().T  # (K, L) - Hermitian transpose for complex correlation
     
-    # For SR (direct path):gamma_SR = (1/L) · Σ · [Y^H · 1]
+    # For SR (direct path):gamma_SR = (1/L) · sigma · [Y^H · 1]
     YH_ones = YH @ ones  # (K, 1)
     gamma_SR_hat = (1.0 / L) * (Xi_dag_best @ YH_ones)  # (Q+1, 1)
     
-    # For STR (tag path):gamma_STR = (1/L) · Σ · [Y^H · x̂]
+    # For STR (tag path):gamma_STR = (1/L) · sigma · [Y^H · x̂]
     YH_x = YH @ x_best  # (K, 1)
     gamma_STR_hat = (1.0 / L) * (Xi_dag_best @ YH_x)  # (Q+1, 1)
 
@@ -931,6 +931,76 @@ def decode_case_II(env: Env, Y: Tensor) -> Tuple[int, int, Tensor, Tensor]:
     return best_c, best_x, gamma_SR_hat, gamma_STR_hat
 
 
+def decode_case_II_hybrid(env: Env, Y: Tensor) -> Tuple[int, int, Tensor, Tensor]:
+    """
+    HYBRID Case II: Combines Case I detection with Case II estimation.
+    
+    This is a diagnostic version to test if regularization hurts detection performance.
+    
+    DETECTION STAGE: Use Case I projection method (formulas 31-33)
+      - Maximize: ||Xi_c Xi_c^† Y^H x||^2 + ||Xi_c Xi_c^† Y^H 1||^2
+      - No regularization bias in detection
+    
+    ESTIMATION STAGE: Use Case II ridge regression (formula 40)
+      - γ_STR = (LΞ^HΞ + λ_STR I)^{-1} Ξ^H Y^T x^*
+      - γ_SR  = (LΞ^HΞ + λ_SR I)^{-1} Ξ^H Y^T 1^*
+      - Regularization for stable estimation
+    
+    Returns:
+      (c_hat, x_hat, gamma_SR_hat, gamma_STR_hat)
+    """
+    device = env.device
+    L, U, Ma = env.L, env.U, env.Ma
+    ones = torch.ones((L, 1), dtype=complex_dtype, device=device)
+
+    # ============================================================
+    # DETECTION STAGE: Case I projection method (NO regularization)
+    # ============================================================
+    YH = Y.conj().T  # (K, L)
+
+    best_val = float("-inf")
+    best_c = 0
+    best_x = 0
+
+    for c in range(Ma):
+        Xi = env.Xi_list[c]  # (K, Q+1)
+        Xi_dag = env.pinv_list[c]  # (Q+1, K)
+        Proj = Xi @ Xi_dag  # (K, K) - projection to column space
+        
+        ProjYH = Proj @ YH  # (K, L)
+        term_const = frob_norm2(ProjYH @ ones).item()
+
+        # Compute ||Proj Y^H x||^2 for all x
+        ProjX = ProjYH @ env.X_mat  # (K, U)
+        vals = (ProjX.conj() * ProjX).real.sum(dim=0)  # (U,)
+        vals = vals + term_const
+
+        # Find maximum
+        vmax, idx = torch.max(vals, dim=0)
+        if vmax.item() > best_val:
+            best_val = vmax.item()
+            best_c = c
+            best_x = int(idx.item())
+
+    # ============================================================
+    # ESTIMATION STAGE: Case II ridge regression (WITH regularization)
+    # ============================================================
+    Xi_best = env.Xi_list[best_c]  # (K, Q+1)
+    ridge_inv_SR_best = env.ridge_inv_SR[best_c]   # (Q+1, Q+1)
+    ridge_inv_STR_best = env.ridge_inv_STR[best_c] # (Q+1, Q+1)
+    x_best = env.X_mat[:, best_x:best_x+1]  # (L, 1)
+    
+    Y_T = Y.T  # (K, L)
+    
+    # γ_STR = (LΞ^HΞ + λ_STR I)^{-1} Ξ^H Y^T x^*
+    gamma_STR_hat = ridge_inv_STR_best @ Xi_best.conj().T @ Y_T @ x_best.conj()
+    
+    # γ_SR = (LΞ^HΞ + λ_SR I)^{-1} Ξ^H Y^T 1^*
+    gamma_SR_hat = ridge_inv_SR_best @ Xi_best.conj().T @ Y_T @ ones.conj()
+
+    return best_c, best_x, gamma_SR_hat, gamma_STR_hat
+
+
 def decode_case_III(env: Env, Y: Tensor) -> Tuple[int, int, Tensor, Tensor]:
     """
     Disjoint decoding (Paper's Case III, formula 43-44):
@@ -1017,6 +1087,7 @@ def run_mc(
     results = {
         "CaseI": {"RadarMER": [], "TagMER": [], "NMSE_SR": [], "NMSE_STR": []},
         "CaseII": {"RadarMER": [], "TagMER": [], "NMSE_SR": [], "NMSE_STR": []},
+        "CaseII_Hybrid": {"RadarMER": [], "TagMER": [], "NMSE_SR": [], "NMSE_STR": []},
         "CaseIII": {"RadarMER": [], "TagMER": [], "NMSE_SR": [], "NMSE_STR": []},
     }
 
@@ -1028,6 +1099,7 @@ def run_mc(
         # Counters
         cnt_I = {"radar_err": 0, "tag_err": 0, "nmse_sr": 0.0, "nmse_str": 0.0}
         cnt_II = {"radar_err": 0, "tag_err": 0, "nmse_sr": 0.0, "nmse_str": 0.0}
+        cnt_II_Hybrid = {"radar_err": 0, "tag_err": 0, "nmse_sr": 0.0, "nmse_str": 0.0}
         cnt_III = {"radar_err": 0, "tag_err": 0, "nmse_sr": 0.0, "nmse_str": 0.0}
 
         for _ in range(N_mc):
@@ -1053,10 +1125,15 @@ def run_mc(
                 device=device
             )
 
-            # Synthesize observation with random channels
-            Y, aux = synthesize_observation(env, c_true, x_true, snr_db, 
-                                          gamma_SR=gamma_SR_trial, 
-                                          gamma_STR=gamma_STR_trial)
+            # Synthesize observation for Case I and Case III (uses Y^H convention)
+            Y_case_I, aux = synthesize_observation(env, c_true, x_true, snr_db, 
+                                                  gamma_SR=gamma_SR_trial, 
+                                                  gamma_STR=gamma_STR_trial)
+            
+            # Synthesize observation for Case II (uses Y^T convention)
+            Y_case_II, aux_II = synthesize_observation_case_II(env, c_true, x_true, snr_db,
+                                                               gamma_SR=gamma_SR_trial,
+                                                               gamma_STR=gamma_STR_trial)
             
             # True channel vectors used in this trial
             gamma_SR_true = aux["gamma_SR"]
@@ -1065,7 +1142,7 @@ def run_mc(
             # ============================================================
             # Decode with Case I (Column space projection with paper's estimation)
             # ============================================================
-            c_hat_I, x_hat_I, gamma_SR_I, gamma_STR_I = decode_case_I(env, Y)
+            c_hat_I, x_hat_I, gamma_SR_I, gamma_STR_I = decode_case_I(env, Y_case_I)
             if c_hat_I != c_true:
                 cnt_I["radar_err"] += 1
             if x_hat_I != x_true:
@@ -1075,8 +1152,9 @@ def run_mc(
             
             # ============================================================
             # Decode with Case II (Ridge + Column space projection)
+            # Uses Y_case_II with Y^T convention
             # ============================================================
-            c_hat_II, x_hat_II, gamma_SR_II, gamma_STR_II = decode_case_II(env, Y)
+            c_hat_II, x_hat_II, gamma_SR_II, gamma_STR_II = decode_case_II(env, Y_case_II)
             if c_hat_II != c_true:
                 cnt_II["radar_err"] += 1
             if x_hat_II != x_true:
@@ -1085,9 +1163,22 @@ def run_mc(
             cnt_II["nmse_str"] += nmse(gamma_STR_II, gamma_STR_true)
             
             # ============================================================
-            # Decode with Case III (Baseline: Separate decoding)
+            # Decode with Case II Hybrid (Case I detection + Case II estimation)
+            # Uses Y_case_I with Y^H convention (same as Case I)
             # ============================================================
-            c_hat_III, x_hat_III, gamma_SR_III, gamma_STR_III = decode_case_III(env, Y)
+            c_hat_II_H, x_hat_II_H, gamma_SR_II_H, gamma_STR_II_H = decode_case_II_hybrid(env, Y_case_I)
+            if c_hat_II_H != c_true:
+                cnt_II_Hybrid["radar_err"] += 1
+            if x_hat_II_H != x_true:
+                cnt_II_Hybrid["tag_err"] += 1
+            cnt_II_Hybrid["nmse_sr"] += nmse(gamma_SR_II_H, gamma_SR_true)
+            cnt_II_Hybrid["nmse_str"] += nmse(gamma_STR_II_H, gamma_STR_true)
+            
+            # ============================================================
+            # Decode with Case III (Baseline: Separate decoding)
+            # Uses Y_case_I with Y^H convention (same as Case I)
+            # ============================================================
+            c_hat_III, x_hat_III, gamma_SR_III, gamma_STR_III = decode_case_III(env, Y_case_I)
             if c_hat_III != c_true:
                 cnt_III["radar_err"] += 1
             if x_hat_III != x_true:
@@ -1099,8 +1190,8 @@ def run_mc(
 
         # Aggregate to rates/means
         for name, cnt in zip(
-            ["CaseI", "CaseII", "CaseIII"],
-            [cnt_I, cnt_II, cnt_III],
+            ["CaseI", "CaseII", "CaseII_Hybrid", "CaseIII"],
+            [cnt_I, cnt_II, cnt_II_Hybrid, cnt_III],
         ):
             results[name]["RadarMER"].append(cnt["radar_err"] / N_mc)
             results[name]["TagMER"].append(cnt["tag_err"] / N_mc)
@@ -1113,6 +1204,9 @@ def run_mc(
         print(f"            "
               f"CaseII MER(R,T)=({results['CaseII']['RadarMER'][-1]:.3f},{results['CaseII']['TagMER'][-1]:.3f}) "
               f"NMSE(SR,STR)=({results['CaseII']['NMSE_SR'][-1]:.3e},{results['CaseII']['NMSE_STR'][-1]:.3e})")
+        print(f"            "
+              f"CaseII_Hybrid MER(R,T)=({results['CaseII_Hybrid']['RadarMER'][-1]:.3f},{results['CaseII_Hybrid']['TagMER'][-1]:.3f}) "
+              f"NMSE(SR,STR)=({results['CaseII_Hybrid']['NMSE_SR'][-1]:.3e},{results['CaseII_Hybrid']['NMSE_STR'][-1]:.3e})")
         print(f"            "
               f"CaseIII MER(R,T)=({results['CaseIII']['RadarMER'][-1]:.3f},{results['CaseIII']['TagMER'][-1]:.3f}) "
               f"NMSE(SR,STR)=({results['CaseIII']['NMSE_SR'][-1]:.3e},{results['CaseIII']['NMSE_STR'][-1]:.3e})")
@@ -1149,7 +1243,7 @@ def main():
     print(f"\nSystem Parameters:")
     print(f"  L={L}, Np={Np}, Q={Q}, K={K}")
     print(f"  Ma={Ma} (radar codes), U={U} (tag codes)")
-    print(f"  Channel: Rician (σ_d²={sigma_d_SR**2:.1f}, σ_r²={sigma_r_SR**2:.1f}, ρ={rho})")
+    print(f"  Channel: Rician (sigma_d²={sigma_d_SR**2:.1f}, sigma_r²={sigma_r_SR**2:.1f}, rho={rho})")
     
     set_seed(2025)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1163,8 +1257,8 @@ def main():
         sigma_d_SR=sigma_d_SR, sigma_r_SR=sigma_r_SR,
         sigma_d_STR=sigma_d_STR, sigma_r_STR=sigma_r_STR,
         rho=rho, seed=2025,
-        lambda_strategy="fixed",  # Use fixed small lambda for stability
-        lambda_value=0.00001,  # Very small regularization for better performance
+        lambda_strategy="fixed",  # Use fixed lambda for sanity check
+        lambda_value=0.0,  # SANITY CHECK: Set λ=0, Case II should degenerate to Case I
         use_gpu_if_available=(device.type == "cuda")
     )
     
@@ -1176,7 +1270,7 @@ def main():
     N_mc = 500
     print(f"SNR grid: {snr_grid_db} dB")
     print(f"Trials per SNR: {N_mc}")
-    print(f"Channel: Rician (σ_d²={sigma_d_SR**2:.1f}, σ_r²={sigma_r_SR**2:.1f}, ρ={rho})")
+    print(f"Channel: Rician (sigma_d²={sigma_d_SR**2:.1f}, sigma_r²={sigma_r_SR**2:.1f}, ρ={rho})")
     
     results = run_mc(env, snr_grid_db, N_mc=N_mc)
     
@@ -1199,10 +1293,14 @@ def main():
     
     # Figure 1: Error Rate vs SNR (Joint vs Disjoint)
     plt.figure(figsize=(10, 6))
-    plt.plot(snr_grid_db, results['CaseI']['RadarMER'], 'o-', color='b', label='Joint, Radar', linewidth=2, markersize=8)
-    plt.plot(snr_grid_db, results['CaseI']['TagMER'], 's--', color='b', label='Joint, Tag', linewidth=2, markersize=8)
-    plt.plot(snr_grid_db, results['CaseIII']['RadarMER'], '^-', color='r', label='Disjoint, Radar', linewidth=2, markersize=8)
-    plt.plot(snr_grid_db, results['CaseIII']['TagMER'], 'v--', color='r', label='Disjoint, Tag', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseI']['RadarMER'], 'o-', color='b', label='Case I (Joint), Radar', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseI']['TagMER'], 's--', color='b', label='Case I (Joint), Tag', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseII']['RadarMER'], 'd-', color='g', label='Case II (Regularized), Radar', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseII']['TagMER'], 'd--', color='g', label='Case II (Regularized), Tag', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseII_Hybrid']['RadarMER'], 'x-', color='orange', label='Case II Hybrid, Radar', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseII_Hybrid']['TagMER'], 'x--', color='orange', label='Case II Hybrid, Tag', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseIII']['RadarMER'], '^-', color='r', label='Case III (Disjoint), Radar', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseIII']['TagMER'], 'v--', color='r', label='Case III (Disjoint), Tag', linewidth=2, markersize=8)
     
     plt.xlabel('SNR (dB)', fontsize=12)
     plt.ylabel('Error Rate', fontsize=12)
@@ -1216,10 +1314,14 @@ def main():
     
     # Figure 2: NMSE vs SNR (Joint vs Disjoint)
     plt.figure(figsize=(10, 6))
-    plt.plot(snr_grid_db, results['CaseI']['NMSE_SR'], 'o-', color='b', label='Joint, SR', linewidth=2, markersize=8)
-    plt.plot(snr_grid_db, results['CaseI']['NMSE_STR'], 's--', color='b', label='Joint, STR', linewidth=2, markersize=8)
-    plt.plot(snr_grid_db, results['CaseIII']['NMSE_SR'], '^-', color='r', label='Disjoint, SR', linewidth=2, markersize=8)
-    plt.plot(snr_grid_db, results['CaseIII']['NMSE_STR'], 'v--', color='r', label='Disjoint, STR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseI']['NMSE_SR'], 'o-', color='b', label='Case I, SR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseI']['NMSE_STR'], 's--', color='b', label='Case I, STR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseII']['NMSE_SR'], 'd-', color='g', label='Case II, SR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseII']['NMSE_STR'], 'd--', color='g', label='Case II, STR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseII_Hybrid']['NMSE_SR'], 'x-', color='orange', label='Case II Hybrid, SR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseII_Hybrid']['NMSE_STR'], 'x--', color='orange', label='Case II Hybrid, STR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseIII']['NMSE_SR'], '^-', color='r', label='Case III, SR', linewidth=2, markersize=8)
+    plt.plot(snr_grid_db, results['CaseIII']['NMSE_STR'], 'v--', color='r', label='Case III, STR', linewidth=2, markersize=8)
     
     plt.xlabel('SNR (dB)', fontsize=12)
     plt.ylabel('NMSE', fontsize=12)
